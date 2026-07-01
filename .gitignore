@@ -1,0 +1,43 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.pyo
+
+# VS Code 本地配置
+.vscode/
+
+# Python 虚拟环境
+.venv/
+venv/
+env/
+
+# 环境变量和密钥
+.env
+.env.*
+*.key
+
+# 模型权重和检查点
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# 大型训练数据
+data/msg_diffms/
+data/pretrain/
+
+# 训练日志和临时输出
+runs/
+wandb/
+logs/
+outputs/
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.temp
