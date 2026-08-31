@@ -75,9 +75,6 @@ data/pretrain/pretrain_smiles.csv
 rerank/artifacts/
 ```
 
-Artifact hashes and evaluation protocols are stored in `metadata/`,
-`evaluation/`, and `rerank/FROZEN_TEST_DECISION_20260721.json`.
-
 ## Repository structure
 
 ```text
