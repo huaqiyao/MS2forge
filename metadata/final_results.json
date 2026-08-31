@@ -1,0 +1,29 @@
+{
+  "selected_checkpoint": "checkpoints/ms2mol_iter80000.pt",
+  "protocol": "diffms_2d",
+  "split": "test",
+  "total_molecules": 17530,
+  "candidates_per_spectrum": 100,
+  "n_timesteps": 20,
+  "seed": 2026,
+  "world_size": 8,
+  "condition_source": "zms",
+  "condition_mode": "real",
+  "topk": {
+    "top1": 0.1845407872219053,
+    "top5": 0.27410154021677124,
+    "top10": 0.29498003422703933
+  },
+  "topk_correct": {
+    "top1": 3235,
+    "top5": 4805,
+    "top10": 5171
+  },
+  "validity": {
+    "n_generated": 1753000,
+    "n_valid": 1239617,
+    "n_valid_connected": 1226021,
+    "valid_rate": 0.7071403308613805,
+    "valid_connected_rate": 0.6993844837421563
+  }
+}

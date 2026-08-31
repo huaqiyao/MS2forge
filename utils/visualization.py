@@ -1,7 +1,7 @@
-"""
-轨迹可视化工具
-使用RDKit SVG渲染，确保化学键（特别是芳香键）符合化学规范
-"""
+
+
+
+
 import json
 from rdkit import Chem
 from rdkit.Chem import AllChem, Draw
@@ -9,37 +9,37 @@ from rdkit.Chem import AllChem, Draw
 
 def create_trajectory_html(smiles, trajectory, true_edge_types, halfedge_index, node_types, atomic_numbers,
                            output_path, mol_idx):
-    """
-    创建交互式HTML轨迹可视化
 
-    使用RDKit SVG绘制，确保化学键（特别是芳香键）符合化学规范
 
-    Args:
-        smiles: 真实分子的SMILES字符串（用于显示）
-        trajectory: 轨迹列表，每个元素是一个时间步的边类型预测 [num_edges]
-        true_edge_types: 真实边类型 [num_edges]
-        halfedge_index: 边索引 [2, num_edges]
-        node_types: 节点类型索引 [num_nodes]
-        atomic_numbers: 原子序数数组 [num_nodes] - 关键！用于构建分子
-        output_path: 输出HTML路径
-        mol_idx: 分子索引
-    """
+
+
+
+
+
+
+
+
+
+
+
+
+
     try:
         if smiles is None:
             smiles = "N/A"
 
-        # 使用atomic_numbers手动构建分子（确保原子顺序一致）
+
         mol = Chem.RWMol()
         for atomic_num in atomic_numbers:
             atom = Chem.Atom(int(atomic_num))
-            atom.SetNoImplicit(True)  # 禁止自动添加隐式氢
+            atom.SetNoImplicit(True)
             mol.AddAtom(atom)
 
-        # 添加真实的化学键（用于计算2D坐标）
+
         for i in range(halfedge_index.shape[1]):
             src, dst = int(halfedge_index[0, i]), int(halfedge_index[1, i])
             bond_type = int(true_edge_types[i])
-            if bond_type > 0:  # 有化学键
+            if bond_type > 0:
                 try:
                     if bond_type == 1:
                         mol.AddBond(src, dst, Chem.BondType.SINGLE)
@@ -50,44 +50,44 @@ def create_trajectory_html(smiles, trajectory, true_edge_types, halfedge_index, 
                     elif bond_type == 4:
                         mol.AddBond(src, dst, Chem.BondType.AROMATIC)
                 except:
-                    pass  # 忽略重复的键
+                    pass
 
         mol = mol.GetMol()
 
-        # 计算2D坐标
+
         AllChem.Compute2DCoords(mol)
 
-        # 验证原子数量
+
         num_atoms = mol.GetNumAtoms()
         if num_atoms != len(atomic_numbers):
-            print(f"[错误] 分子 {mol_idx}: 原子数量不匹配！")
+            print(f"[ERROR] molecule {mol_idx}: Atom-count mismatch！")
             return
 
-        # 生成真实分子的SVG（用于右侧显示）
+
         true_mol_drawer = Draw.MolDraw2DSVG(600, 600)
         true_mol_drawer.DrawMolecule(mol)
         true_mol_drawer.FinishDrawing()
         true_mol_svg = true_mol_drawer.GetDrawingText()
 
-        # 使用RDKit生成每一步的SVG图像
+
         trajectory_svgs = []
 
         for step_idx, pred_edge_types in enumerate(trajectory):
-            # 计算准确率
+
             total_acc = float((pred_edge_types == true_edge_types).mean())
 
-            # 创建分子副本用于绘制
+
             mol_copy = Chem.RWMol()
             for atomic_num in atomic_numbers:
                 atom = Chem.Atom(int(atomic_num))
-                atom.SetNoImplicit(True)  # 禁止自动添加隐式氢
+                atom.SetNoImplicit(True)
                 mol_copy.AddAtom(atom)
 
-            # 添加预测的化学键
+
             for i in range(halfedge_index.shape[1]):
                 src, dst = int(halfedge_index[0, i]), int(halfedge_index[1, i])
                 bond_type = int(pred_edge_types[i])
-                if bond_type > 0:  # 有化学键
+                if bond_type > 0:
                     try:
                         if bond_type == 1:
                             mol_copy.AddBond(src, dst, Chem.BondType.SINGLE)
@@ -98,15 +98,15 @@ def create_trajectory_html(smiles, trajectory, true_edge_types, halfedge_index, 
                         elif bond_type == 4:
                             mol_copy.AddBond(src, dst, Chem.BondType.AROMATIC)
                     except:
-                        pass  # 忽略重复的键
+                        pass
 
             mol_copy = mol_copy.GetMol()
 
-            # 使用原始分子的2D坐标
+
             mol_copy.RemoveAllConformers()
             mol_copy.AddConformer(mol.GetConformer(), assignId=True)
 
-            # 生成SVG
+
             drawer = Draw.MolDraw2DSVG(600, 600)
             drawer.DrawMolecule(mol_copy)
             drawer.FinishDrawing()
@@ -118,13 +118,13 @@ def create_trajectory_html(smiles, trajectory, true_edge_types, halfedge_index, 
                 'svg': svg
             })
 
-        # 生成HTML（左右布局，学术风格黑白配色）
+
         html_content = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>分子 {mol_idx} 去噪轨迹</title>
+    <title>molecule {mol_idx} denoising trajectory</title>
     <style>
         * {{
             margin: 0;
@@ -315,21 +315,21 @@ def create_trajectory_html(smiles, trajectory, true_edge_types, halfedge_index, 
     </div>
 
     <script>
-        // 轨迹数据（SVG）
+        // trajectory data(SVG)
         const trajectoryData = {json.dumps(trajectory_svgs)};
 
-        // 当前步骤
+        // current step
         let currentStep = 0;
         let isPlaying = false;
         let playInterval = null;
 
-        // 显示指定步骤的分子
+        // display the molecule at the selected step
         function showStep(stepIndex) {{
             const data = trajectoryData[stepIndex];
             const container = document.getElementById('trajectory-container');
             container.innerHTML = data.svg;
 
-            // 更新信息
+            // update information
             document.getElementById('stepInfo').textContent = `Step: ${{data.step}}/${{trajectoryData.length}}`;
             document.getElementById('accInfo').textContent = `Accuracy: ${{data.accuracy.toFixed(3)}}`;
 
@@ -337,7 +337,7 @@ def create_trajectory_html(smiles, trajectory, true_edge_types, halfedge_index, 
             document.getElementById('stepSlider').value = stepIndex;
         }}
 
-        // 播放/暂停（播放速度为原来的1.5倍，约133ms）
+        // play/pause(playback speed is 1.5x, approximately 133ms)
         document.getElementById('playBtn').addEventListener('click', function() {{
             if (isPlaying) {{
                 clearInterval(playInterval);
@@ -358,44 +358,44 @@ def create_trajectory_html(smiles, trajectory, true_edge_types, halfedge_index, 
             }}
         }});
 
-        // 上一步
+        // previous step
         document.getElementById('prevBtn').addEventListener('click', function() {{
             if (currentStep > 0) {{
                 showStep(currentStep - 1);
             }}
         }});
 
-        // 下一步
+        // next step
         document.getElementById('nextBtn').addEventListener('click', function() {{
             if (currentStep < trajectoryData.length - 1) {{
                 showStep(currentStep + 1);
             }}
         }});
 
-        // 重置
+        // reset
         document.getElementById('resetBtn').addEventListener('click', function() {{
             showStep(0);
         }});
 
-        // 滑块
+        // slider
         document.getElementById('stepSlider').addEventListener('input', function() {{
             showStep(parseInt(this.value));
         }});
 
-        // 初始化
+        // initialization
         showStep(0);
     </script>
 </body>
 </html>
 """
 
-        # 保存HTML文件
+
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
 
-        print(f"[成功] 轨迹HTML已保存: {output_path}")
+        print(f"[successful] trajectoryHTMLsaved: {output_path}")
 
     except Exception as e:
-        print(f"[错误] 生成HTML失败: {e}")
+        print(f"[ERROR] generateHTMLfailed: {e}")
         import traceback
         traceback.print_exc()

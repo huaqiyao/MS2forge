@@ -1,0 +1,39 @@
+name: ms2forge
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9.23
+  - pip=25.2
+  - pytorch=2.3.1
+  - pytorch-cuda=11.8
+  - numpy=1.26.4
+  - pandas=2.2.2
+  - scipy=1.13.1
+  - scikit-learn=1.6.1
+  - rdkit=2024.09.4
+  - pyyaml=6.0.2
+  - h5py=3.14.0
+  - matplotlib=3.9.4
+  - seaborn=0.13.2
+  - joblib=1.5.1
+  - requests=2.32.5
+  - tqdm=4.67.1
+  - openpyxl
+  - pytest
+  - pip:
+      - easydict==1.13
+      # Required to load the frozen EvidenceRank / Stage-A LGBMRanker bundles.
+      # 4.6.0 retains Python 3.9 wheels; LightGBM 4.7 requires Python >=3.10.
+      - lightgbm==4.6.0
+      - lmdb==2.2.1
+      - tensorboard==2.20.0
+      - torch-geometric==2.3.1
+      # PyG Linux/Python 3.9 wheels matching PyTorch 2.3 + CUDA 11.8.
+      - https://data.pyg.org/whl/torch-2.3.0%2Bcu118/pyg_lib-0.4.0%2Bpt23cu118-cp39-cp39-linux_x86_64.whl
+      - https://data.pyg.org/whl/torch-2.3.0%2Bcu118/torch_scatter-2.1.2%2Bpt23cu118-cp39-cp39-linux_x86_64.whl
+      - https://data.pyg.org/whl/torch-2.3.0%2Bcu118/torch_sparse-0.6.18%2Bpt23cu118-cp39-cp39-linux_x86_64.whl
+      - https://data.pyg.org/whl/torch-2.3.0%2Bcu118/torch_cluster-1.6.3%2Bpt23cu118-cp39-cp39-linux_x86_64.whl
+      - https://data.pyg.org/whl/torch-2.3.0%2Bcu118/torch_spline_conv-1.2.2%2Bpt23cu118-cp39-cp39-linux_x86_64.whl

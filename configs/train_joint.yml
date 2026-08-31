@@ -1,0 +1,76 @@
+# Research-only joint training config. No released checkpoint was trained in
+# this stage. The implementation keeps Zmol off the Zms Adapter path and uses
+# Zmol targets for Adapter MSE/KD on the MS2Mol batch.
+model:
+  stage: joint
+  align_ckpt_path: ./checkpoints/align.pt
+  contrastive_dim: 512
+  node_dim: 256
+  noise_scale: 0.0
+  condition_embedding: {embed_dim: 256}
+  ms_encoder:
+    dim_sos: 13
+    dim_formula: 144
+    hidden_dim: 512
+    num_transformer_layers: 3
+    nhead: 8
+    dropout: 0.1
+    input_dropout: 0.1
+    max_len: 129
+  graph_encoder: {n_layers: 4}
+  gat: {hidden_dim: 512, num_layers: 6, dropout: 0.15}
+  flow: {n_timesteps: 100, eval_n_timesteps: 20}
+  flash: {beta1: 3.0}
+
+train:
+  seed: 2026
+  batch_size: 16
+  num_workers: 0
+  pin_memory: false
+  max_iters: 100001
+  val_freq: 2000
+  save_freq: 2000
+  max_grad_norm: 50.0
+  warmup_iters: 500
+  val_subset_ratio: 0.1
+  eval_batch_size: 32
+  eval_num_samples: 1
+  eval_split: val
+  eval_mode: strict
+  log_edge_distribution: false
+  student_condition_mode: real
+  teacher_condition_mode: real
+  default_instrument_idx: 2
+  default_ionization_idx: 0
+  ms2mol:
+    adapter: {enabled: true, hidden_dim: 1024, mse_weight: 0.5, dropout: 0.1}
+    distill:
+      enabled: true
+      teacher_ckpt: ./checkpoints/graph2mol_iter1460000.pt
+      weight: 1.0
+      temperature: 2.0
+      feature_weight: 0.5
+      feature_layers: all
+  joint:
+    weight_ms2mol: 5.0
+    batch_size_g2m: 64
+    batch_size_ms2: 16
+  optimizer: {type: adamw, lr: 5.0e-5, weight_decay: 1.0e-4, beta1: 0.99, beta2: 0.999}
+  scheduler: {type: plateau, factor: 0.8, patience: 1000, min_lr: 1.0e-6}
+
+transform: {use_mask_node: true, use_mask_edge: false}
+
+dataset:
+  name: msg_diffms
+  root: ./data/msg_diffms
+  data_split_mode: split
+  instrument_type: all
+  data_subset_ratio: 1.0
+  max_peaks: 128
+  cache_dir: ./data/cache
+  graph2mol_root: ./data/pretrain
+  graph2mol_smiles_file: ./data/pretrain/pretrain_smiles.csv
+
+chem:
+  atomic_numbers: [5, 6, 7, 8, 9, 14, 15, 16, 17, 33, 34, 35, 53]
+  mol_bond_types: [1, 2, 3, 4]

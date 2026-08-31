@@ -1,0 +1,84 @@
+{
+  "status": "passed",
+  "files": {
+    "checkpoints/align.pt": {
+      "size": 151822020,
+      "sha256": "a29c443dde401cbd97911fa7e56a835cc156af7768346febbace6317b8d940db",
+      "hash_checked": true
+    },
+    "checkpoints/graph2mol_iter1460000.pt": {
+      "size": 455385676,
+      "sha256": "bceafa0bdc8cd28cfa58425da697cfff3f0d1a4df1b0c7d3e888d560e97a4c1f",
+      "hash_checked": true
+    },
+    "checkpoints/ms2mol_iter80000.pt": {
+      "size": 464827486,
+      "sha256": "a77bd0fa4dcd41488a04dc1e4bd7bc780bc837aba6eaa0dbe46f2efb4b082778",
+      "hash_checked": true
+    },
+    "data/cache/zms_v1.pt": {
+      "size": 304977558,
+      "sha256": "5b2e37cbda6e6ef8f70e66c2d6e5b5570e0449ad08d7f30e8f1af02a12fc247c",
+      "hash_checked": false
+    },
+    "data/cache/zmol_v1.pt": {
+      "size": 4463726086,
+      "sha256": "10aeb77702f9cfb1e7392d4ddeeb9c2fdbcf5664427be684824f3c22f07179c5",
+      "hash_checked": false
+    },
+    "data/cache/zmol_v1.pt.ready": {
+      "size": 18,
+      "sha256": "0e0137d662fbf47c1d38f7bb43de90cf589517aebb3b487517054df1a8f63457",
+      "hash_checked": true
+    }
+  },
+  "checkpoints": {
+    "align": {
+      "stage": "align",
+      "iteration": 19000,
+      "ms_encoder_tensors": 47,
+      "graph_encoder_tensors": 240,
+      "strict_load": true
+    },
+    "graph2mol": {
+      "stage": "graph2mol",
+      "iteration": 1460000,
+      "missing_keys": [],
+      "whitelisted_unexpected_keys": [
+        "edge_precision_head.0.bias",
+        "edge_precision_head.0.weight",
+        "edge_precision_head.2.bias",
+        "edge_precision_head.2.weight"
+      ],
+      "lora_keys": 0
+    },
+    "ms2mol": {
+      "stage": "ms2mol",
+      "iteration": 80000,
+      "strict_load": true,
+      "adapter_keys": [
+        "zms_adapter.0.bias",
+        "zms_adapter.0.weight",
+        "zms_adapter.3.bias",
+        "zms_adapter.3.weight"
+      ],
+      "lora_keys": 0,
+      "student_condition_mode": "real",
+      "teacher_condition_mode": "real"
+    },
+    "graph_to_ms2mol": {
+      "missing_keys": [
+        "zms_adapter.0.bias",
+        "zms_adapter.0.weight",
+        "zms_adapter.3.bias",
+        "zms_adapter.3.weight"
+      ],
+      "unexpected_keys": [
+        "edge_precision_head.0.bias",
+        "edge_precision_head.0.weight",
+        "edge_precision_head.2.bias",
+        "edge_precision_head.2.weight"
+      ]
+    }
+  }
+}

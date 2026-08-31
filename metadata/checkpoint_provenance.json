@@ -1,0 +1,58 @@
+{
+  "release_date": "2026-08-06",
+  "source_git_head": "25b7ef8",
+  "source_worktree_had_uncommitted_changes": true,
+  "lora_used_by_released_checkpoints": false,
+  "generic_freeze_finetuning_used_by_released_checkpoints": false,
+  "checkpoints": [
+    {
+      "file": "checkpoints/align.pt",
+      "sha256": "a29c443dde401cbd97911fa7e56a835cc156af7768346febbace6317b8d940db",
+      "stage": "align",
+      "iteration": 19000,
+      "contrastive_dim": 512,
+      "config": "configs/align_cache.yml",
+      "role": "fixed Zms/Zmol encoder artifact",
+      "training_source": "reproducibility/align_training_historical_source",
+      "exact_from_scratch_retraining": false,
+      "limitation": "original Encoder_Contrastive_FragHub.pth initializer is missing"
+    },
+    {
+      "file": "checkpoints/graph2mol_iter1460000.pt",
+      "sha256": "bceafa0bdc8cd28cfa58425da697cfff3f0d1a4df1b0c7d3e888d560e97a4c1f",
+      "stage": "graph2mol",
+      "iteration": 1460000,
+      "hidden_dim": 512,
+      "num_layers": 6,
+      "world_size": 8,
+      "per_gpu_batch_size": 16,
+      "global_batch_size": 128,
+      "seed": 2026,
+      "config": "configs/train_graph2mol.yml",
+      "role": "MS2Mol initialization and frozen KD teacher",
+      "legacy_unexpected_keys": [
+        "edge_precision_head.0.weight",
+        "edge_precision_head.0.bias",
+        "edge_precision_head.2.weight",
+        "edge_precision_head.2.bias"
+      ]
+    },
+    {
+      "file": "checkpoints/ms2mol_iter80000.pt",
+      "sha256": "a77bd0fa4dcd41488a04dc1e4bd7bc780bc837aba6eaa0dbe46f2efb4b082778",
+      "stage": "ms2mol",
+      "iteration": 80000,
+      "hidden_dim": 512,
+      "num_layers": 6,
+      "world_size": 4,
+      "per_gpu_batch_size": 16,
+      "global_batch_size": 64,
+      "seed": 2026,
+      "config": "configs/train_ms2mol.yml",
+      "role": "selected final model",
+      "strict_load_with_release_code": true,
+      "adapter_parameter_keys": 4,
+      "lora_parameter_keys": 0
+    }
+  ]
+}

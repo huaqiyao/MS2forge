@@ -1,0 +1,40 @@
+model:
+  stage: ms2mol
+  contrastive_dim: 512
+  node_dim: 256
+  noise_scale: 0.0
+  condition_embedding: {embed_dim: 256}
+  ms_encoder: {dim_sos: 13, dim_formula: 144, hidden_dim: 512, num_transformer_layers: 3, nhead: 8, dropout: 0.1, input_dropout: 0.1, max_len: 129}
+  graph_encoder: {n_layers: 4}
+  gat: {hidden_dim: 512, num_layers: 6, dropout: 0.15}
+  flow: {n_timesteps: 20}
+  flash: {beta1: 3.0}
+dataset:
+  name: msg_diffms
+  root: ./examples/nplib1_10/data
+  data_split_mode: split
+  instrument_type: all
+  max_peaks: 128
+  cache_dir: ./examples/nplib1_10/cache
+chem:
+  atomic_numbers: [5, 6, 7, 8, 9, 14, 15, 16, 17, 33, 34, 35, 53]
+  mol_bond_types: [1, 2, 3, 4]
+transform: {use_mask_node: true, use_mask_edge: false}
+evaluate:
+  split: test
+  subset_ratio: 1.0
+  n_samples: 100
+  n_timesteps: 20
+  eval_mode: diffms_2d
+  condition_mode: real
+  condition_source: zms
+  batch_size: 10
+  topk: [1, 5, 10]
+  inner_chunk: 20
+  seed: 2026
+  output_dir: ./examples/nplib1_10/outputs
+  save_per_spec: false
+  save_candidate_cache: true
+ckpt:
+  ms2mol: ./checkpoints/nplib1/ms2mol_best.pt
+  align: ./checkpoints/nplib1/align_best.pt

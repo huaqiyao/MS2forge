@@ -1,43 +1,68 @@
-# Python 缓存
-__pycache__/
-*.py[cod]
-*.pyo
-
-# VS Code 本地配置
-.vscode/
-
-# Python 虚拟环境
-.venv/
-venv/
-env/
-
-# 环境变量和密钥
-.env
-.env.*
-*.key
-
-# 模型权重和检查点
+# Checkpoints, trained models and binary artifacts
 checkpoints/
+checkpoint/
+ckpts/
+weights/
+artifacts/
 *.pt
 *.pth
 *.ckpt
+*.bin
 *.safetensors
+*.onnx
+*.pkl
+*.pickle
 
-# 大型训练数据
-data/msg_diffms/
-data/pretrain/
+# Datasets, caches and large arrays
+data/
+dataset/
+datasets/
+cache/
+caches/
+*.lmdb
+*.mdb
+*.npy
+*.npz
+*.h5
+*.hdf5
 
-# 训练日志和临时输出
+# Generated outputs
+outputs/
+results/
+eval_results/
 runs/
 wandb/
+lightning_logs/
 logs/
-outputs/
+*.jsonl
 *.log
 
-# 系统文件
+# Python and test caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments, secrets, editors and operating systems
+.env
+.env.*
+venv/
+.venv/
+env/
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
 
-# 临时文件
+# Temporary files
 *.tmp
 *.temp
+*.swp
+
+# Explicitly allow the small, audited NPLIB1 ten-spectrum demo requested for
+# reviewer use. Full datasets/caches/checkpoints remain ignored above.
+!examples/
+!examples/nplib1_10/
+!examples/nplib1_10/**

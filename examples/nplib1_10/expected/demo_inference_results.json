@@ -1,0 +1,490 @@
+{
+  "schema": "ms2forge.nplib1_10_demo_inference.v1",
+  "purpose": "single-GPU rerun with the final local code on the curated ten-spectrum demo bundle",
+  "warning": "curated success-case demo; do not report as an unbiased NPLIB1 estimate",
+  "protocol": {
+    "split": "test",
+    "total_mols": 10,
+    "n_samples": 100,
+    "n_timesteps": 20,
+    "subset_ratio": 1.0,
+    "seed": 2026,
+    "distributed": false,
+    "world_size": 1,
+    "elapsed_sec": 19.68468165397644,
+    "ms2mol_ckpt": "checkpoints/ms2mol_best.pt",
+    "align_ckpt": "checkpoints/align_best.pt",
+    "adapter_ckpt": null,
+    "adapter_source": "checkpoints/ms2mol_best.pt",
+    "decoder_state_sha256": "f4e9dcb3c1ba62df5b9785d25ca9d3ce75815782fe09c2aff379b790efe1baa5",
+    "indices_json": null,
+    "indices_manifest_sha256": null,
+    "resume_progress": false,
+    "progress_jsonl_rank0": null,
+    "eval_mode": "diffms_2d",
+    "condition_mode": "real",
+    "condition_source": "zms",
+    "candidate_cache_jsonl_rank0": "examples/nplib1_10/validation_outputs/candidates.jsonl",
+    "topk": {
+      "top1": 0.9,
+      "top5": 1.0,
+      "top10": 1.0
+    },
+    "topk_correct": {
+      "top1": 9,
+      "top5": 10,
+      "top10": 10
+    },
+    "edge_accuracy": 0.9972630858706808,
+    "bond_accuracy": 0.979757085020243,
+    "validity": {
+      "n_generated": 1000,
+      "n_valid": 996,
+      "n_valid_connected": 995,
+      "n_invalid": 4,
+      "n_disconnected": 1,
+      "valid_rate": 0.996,
+      "valid_connected_rate": 0.995
+    }
+  },
+  "checkpoint_provenance": {
+    "encoder": {
+      "path": "checkpoints/Encoder_Contrastive_FragHub.pth",
+      "sha256": "42d0e56c8dcce05fa78d724ed1821f305a8c7694fcba2bf40f7156a47be16a48",
+      "bytes": 151980622
+    },
+    "align": {
+      "path": "checkpoints/align_best.pt",
+      "sha256": "53e30d272f2839f7d4bbc0ca4eeaca89838d1af28438841277b860ccbaba761f",
+      "bytes": 151823614
+    },
+    "graph2mol": {
+      "path": "checkpoints/graph2mol_best.pt",
+      "sha256": "7f4814cbce5b9e3df2c36fc54b51e848d9034828314b9554b244af3f1bb60858",
+      "bytes": 452218618
+    },
+    "ms2mol": {
+      "path": "checkpoints/ms2mol_best.pt",
+      "sha256": "04700868ac9a1be4eec6089251c968501380f06d8cb78da694a17cb2505cfc2d",
+      "bytes": 464819540
+    }
+  },
+  "records": [
+    {
+      "spec_id": "CCMSLIB00000845714",
+      "true_canonical_smiles": "COc1cc(O)c2c(c1)OC(c1ccccc1)CC2=O",
+      "hits": {
+        "1": true,
+        "5": true,
+        "10": true
+      },
+      "n_generated": 100,
+      "n_valid": 100,
+      "n_valid_connected": 100,
+      "n_invalid": 0,
+      "n_disconnected": 0,
+      "ranked_connected_candidates": [
+        {
+          "smiles": "COc1cc(O)c2c(c1)OC(c1ccccc1)CC2=O",
+          "frequency": 87
+        },
+        {
+          "smiles": "COc1cc(O)c2c(c1)OC(Cc1ccccc1)C2=O",
+          "frequency": 8
+        },
+        {
+          "smiles": "COc1cc(O)c2c(c1)OCC(c1ccccc1)C2=O",
+          "frequency": 2
+        },
+        {
+          "smiles": "COc1cc(O)c2c(c1)OCCc1ccccc1C2=O",
+          "frequency": 1
+        },
+        {
+          "smiles": "COC1=CC(OC)=C(C(=O)CCc2ccccc2)C1=O",
+          "frequency": 1
+        },
+        {
+          "smiles": "COc1cc(O)cc2c1OC(c1ccccc1)CC2=O",
+          "frequency": 1
+        }
+      ]
+    },
+    {
+      "spec_id": "CCMSLIB00005465740",
+      "true_canonical_smiles": "CC(CC(O)C(=O)NCCS(=O)(=O)O)C1CCC2C3CCC4CC(O)CCC4(C)C3CCC12C",
+      "hits": {
+        "1": true,
+        "5": true,
+        "10": true
+      },
+      "n_generated": 100,
+      "n_valid": 99,
+      "n_valid_connected": 99,
+      "n_invalid": 1,
+      "n_disconnected": 0,
+      "ranked_connected_candidates": [
+        {
+          "smiles": "CC(CC(O)C(=O)NCCS(=O)(=O)O)C1CCC2C3CCC4CC(O)CCC4(C)C3CCC12C",
+          "frequency": 73
+        },
+        {
+          "smiles": "CC(CCOC(=O)NCCS(=O)(=O)O)C1CCC2C3CCC4CC(O)CCC4(C)C3CCC12C",
+          "frequency": 15
+        },
+        {
+          "smiles": "CC(C)(C(O)C(=O)NCCS(=O)(=O)O)C1CCC2C3CCC4CC(O)CCC4(C)C3CCC21C",
+          "frequency": 3
+        },
+        {
+          "smiles": "CC(CCOC(O)=NCCS(=O)(=O)O)C1CCC2C3CCC4CC(O)CCC4(C)C3CCC12C",
+          "frequency": 2
+        },
+        {
+          "smiles": "CC(CC(O)C(O)=NCCS(=O)(=O)O)C1CCC2C3CCC4CC(O)CCC4(C)C3CCC12C",
+          "frequency": 2
+        },
+        {
+          "smiles": "CC(CC(O)C(O)=NCCS(=O)(=O)O)C1CCC2C3CC=C4CC(O)CCC4(C)C3CCC12C",
+          "frequency": 1
+        },
+        {
+          "smiles": "CC(CCOC(=O)NCCS(=O)(=O)O)C1CCC2C3CCC4CC(O)CCC45CC35CCC12C",
+          "frequency": 1
+        },
+        {
+          "smiles": "CC(C(CO)C(=O)NCCS(=O)(=O)O)C1CCC2C3CCC4CC(O)CCC4(C)C3CCC12C",
+          "frequency": 1
+        },
+        {
+          "smiles": "CC(CC(O)C(=O)NCCS(=O)(=O)O)C1CCC2C3CCC4CC(=O)CCC4(C)C3CCC12C",
+          "frequency": 1
+        }
+      ]
+    },
+    {
+      "spec_id": "CCMSLIB00003139869",
+      "true_canonical_smiles": "O=c1c(-c2ccc(O)cc2)coc2cc(OC3OC(CO)C(O)C(O)C3O)ccc12",
+      "hits": {
+        "1": true,
+        "5": true,
+        "10": true
+      },
+      "n_generated": 100,
+      "n_valid": 100,
+      "n_valid_connected": 100,
+      "n_invalid": 0,
+      "n_disconnected": 0,
+      "ranked_connected_candidates": [
+        {
+          "smiles": "O=c1c(-c2ccc(O)cc2)coc2cc(OC3OC(CO)C(O)C(O)C3O)ccc12",
+          "frequency": 97
+        },
+        {
+          "smiles": "O=c1cc(-c2cccc(O)c2)oc2cc(OC3OC(CO)C(O)C(O)C3O)ccc12",
+          "frequency": 1
+        },
+        {
+          "smiles": "O=C1c2ccc(OC3OC(CO)C(O)C(O)C3O)cc2OCC1c1ccc(O)cc1",
+          "frequency": 1
+        },
+        {
+          "smiles": "O=C1C(c2ccc(O)cc2)=C(O)c2cc(OC3OC(CO)C(O)C(O)C3O)ccc21",
+          "frequency": 1
+        }
+      ]
+    },
+    {
+      "spec_id": "CCMSLIB00000846725",
+      "true_canonical_smiles": "COc1cc(O)c(CC=C(C)C)c(O)c1C(=O)C=Cc1ccc(O)cc1",
+      "hits": {
+        "1": true,
+        "5": true,
+        "10": true
+      },
+      "n_generated": 100,
+      "n_valid": 100,
+      "n_valid_connected": 100,
+      "n_invalid": 0,
+      "n_disconnected": 0,
+      "ranked_connected_candidates": [
+        {
+          "smiles": "COc1cc(O)c(CC=C(C)C)c(O)c1C(=O)C=Cc1ccc(O)cc1",
+          "frequency": 91
+        },
+        {
+          "smiles": "COc1cc(OCC=C(C)C)cc(O)c1C(=O)C=Cc1ccc(O)cc1",
+          "frequency": 3
+        },
+        {
+          "smiles": "COc1cc(O)c(CC=C(C)C)c(O)c1C(=O)CCc1ccc(O)cc1",
+          "frequency": 3
+        },
+        {
+          "smiles": "CC=C(C)COc1cc(O)c(C(=O)C=Cc2ccc(O)cc2)c(OC)c1",
+          "frequency": 1
+        },
+        {
+          "smiles": "COC1=CC=C(C(=O)c2ccccc2O)C(O)=C(CC=C(C)C)C(O)=C1",
+          "frequency": 1
+        },
+        {
+          "smiles": "COc1cc(OC)c(C(=O)C=Cc2ccc(O)cc2)c(O)c1C=C(C)C",
+          "frequency": 1
+        }
+      ]
+    },
+    {
+      "spec_id": "CCMSLIB00000577981",
+      "true_canonical_smiles": "O=C(O)C(O)COP(=O)(O)O",
+      "hits": {
+        "1": true,
+        "5": true,
+        "10": true
+      },
+      "n_generated": 100,
+      "n_valid": 100,
+      "n_valid_connected": 100,
+      "n_invalid": 0,
+      "n_disconnected": 0,
+      "ranked_connected_candidates": [
+        {
+          "smiles": "O=C(O)C(O)COP(=O)(O)O",
+          "frequency": 94
+        },
+        {
+          "smiles": "O=C(O)COCOP(=O)(O)O",
+          "frequency": 4
+        },
+        {
+          "smiles": "O=P(O)(O)OCC(O)(O)CO",
+          "frequency": 1
+        },
+        {
+          "smiles": "O=P(O)(O)OCC(O)C(O)O",
+          "frequency": 1
+        }
+      ]
+    },
+    {
+      "spec_id": "mona_1352",
+      "true_canonical_smiles": "CC(O)CNCCOc1c(Cl)cc(Cl)cc1Cl",
+      "hits": {
+        "1": true,
+        "5": true,
+        "10": true
+      },
+      "n_generated": 100,
+      "n_valid": 100,
+      "n_valid_connected": 99,
+      "n_invalid": 0,
+      "n_disconnected": 1,
+      "ranked_connected_candidates": [
+        {
+          "smiles": "CC(O)CNCCOc1c(Cl)cc(Cl)cc1Cl",
+          "frequency": 74
+        },
+        {
+          "smiles": "CC(O)CN(C)C(=O)c1c(Cl)cc(Cl)cc1Cl",
+          "frequency": 5
+        },
+        {
+          "smiles": "CC(=O)CNCCOc1c(Cl)cc(Cl)cc1Cl",
+          "frequency": 3
+        },
+        {
+          "smiles": "CC(O)CN(C)COc1c(Cl)cc(Cl)cc1Cl",
+          "frequency": 3
+        },
+        {
+          "smiles": "CC(O)CNC(C)Oc1c(Cl)cc(Cl)cc1Cl",
+          "frequency": 2
+        },
+        {
+          "smiles": "CCOCNCCOc1c(Cl)cc(Cl)cc1Cl",
+          "frequency": 2
+        },
+        {
+          "smiles": "CCNC(Oc1c(Cl)cc(Cl)cc1Cl)C(C)O",
+          "frequency": 2
+        },
+        {
+          "smiles": "CCOCN(C)COc1c(Cl)cc(Cl)cc1Cl",
+          "frequency": 1
+        },
+        {
+          "smiles": "CCOC(N)(CC)Oc1c(Cl)cc(Cl)cc1Cl",
+          "frequency": 1
+        },
+        {
+          "smiles": "CCNC(OCC)Oc1c(Cl)cc(Cl)cc1Cl",
+          "frequency": 1
+        }
+      ]
+    },
+    {
+      "spec_id": "CCMSLIB00001059041",
+      "true_canonical_smiles": "C[Si](Cn1cncn1)(c1ccc(F)cc1)c1ccc(F)cc1",
+      "hits": {
+        "1": true,
+        "5": true,
+        "10": true
+      },
+      "n_generated": 100,
+      "n_valid": 99,
+      "n_valid_connected": 99,
+      "n_invalid": 1,
+      "n_disconnected": 0,
+      "ranked_connected_candidates": [
+        {
+          "smiles": "C[Si](Cn1cncn1)(c1ccc(F)cc1)c1ccc(F)cc1",
+          "frequency": 98
+        },
+        {
+          "smiles": "C[SiH](CNc1ncnc2ccc(F)cc12)c1ccc(F)cc1",
+          "frequency": 1
+        }
+      ]
+    },
+    {
+      "spec_id": "CCMSLIB00005465885",
+      "true_canonical_smiles": "CSCCC(NC(=O)CCC(C)C1CCC2C3C(O)CC4CC(O)CCC4(C)C3CC(O)C12C)C(=O)O",
+      "hits": {
+        "1": true,
+        "5": true,
+        "10": true
+      },
+      "n_generated": 100,
+      "n_valid": 99,
+      "n_valid_connected": 99,
+      "n_invalid": 1,
+      "n_disconnected": 0,
+      "ranked_connected_candidates": [
+        {
+          "smiles": "CSCCC(NC(=O)CCC(C)C1CCC2C3C(O)CC4CC(O)CCC4(C)C3CC(O)C12C)C(=O)O",
+          "frequency": 64
+        },
+        {
+          "smiles": "CSC1CC(NC(=O)CCC(C)C2CCC3C4C(O)CC5CC(O)CCC5(C)C4CC(O)C23C)C(=O)O1",
+          "frequency": 7
+        },
+        {
+          "smiles": "CSCCC(NC(=O)C=CC(C)C1CCC2C3C(O)CC4CC(O)CCC4(C)C3CC(O)C12C)C(=O)O",
+          "frequency": 7
+        },
+        {
+          "smiles": "CSCCC(NC(=O)CCCCC1CCC2C3C(O)CC4CC(O)CCC4(C)C3CC(O)C12C)C(=O)O",
+          "frequency": 3
+        },
+        {
+          "smiles": "CSCCC(NC(=O)CCC(C)C1CCC2C3C4OC4C4CC(O)CCC4(C)C3CC(O)C12C)C(=O)O",
+          "frequency": 3
+        },
+        {
+          "smiles": "CSCCC(NC(=O)CCCCC1C2CC3C4C(O)CC5CC(O)CCC5(C)C4CC(O2)C13C)C(=O)O",
+          "frequency": 1
+        },
+        {
+          "smiles": "CSCCC(NC(=O)CCC(C)C1CCC2C3C(=O)CC4CC(O)CCC4(C)C3CC(O)C12C)C(=O)O",
+          "frequency": 1
+        },
+        {
+          "smiles": "CSCCC(CCC(C)C1CCC2C(C(O)CC3CC(O)CCC3CCC2(C)O)C1CC(=O)O)NC=O",
+          "frequency": 1
+        },
+        {
+          "smiles": "CSCCC(NC(=O)CCC1C2CCC3C4C(O)CC5CC(O)CCC5(C)C4CC(O)C3(C)C12)C(=O)O",
+          "frequency": 1
+        },
+        {
+          "smiles": "CSCCC(NCOCCC(C)C1CCC2C3C(O)CC4CC(O)CCC4(C)C3CC(O)C12C)C(=O)O",
+          "frequency": 1
+        }
+      ]
+    },
+    {
+      "spec_id": "CCMSLIB00000085128",
+      "true_canonical_smiles": "CN(C)CCN(Cc1cccs1)c1ccccn1",
+      "hits": {
+        "1": true,
+        "5": true,
+        "10": true
+      },
+      "n_generated": 100,
+      "n_valid": 99,
+      "n_valid_connected": 99,
+      "n_invalid": 1,
+      "n_disconnected": 0,
+      "ranked_connected_candidates": [
+        {
+          "smiles": "CN(C)CCN(Cc1cccs1)c1ccccn1",
+          "frequency": 83
+        },
+        {
+          "smiles": "CNCCCN(Cc1cccs1)c1ccccn1",
+          "frequency": 7
+        },
+        {
+          "smiles": "CN(CCCNCc1cccs1)c1ccccn1",
+          "frequency": 2
+        },
+        {
+          "smiles": "CN(C)CC(NCc1cccs1)c1ccccn1",
+          "frequency": 1
+        },
+        {
+          "smiles": "CN(C)CCNC(c1ccccn1)c1cccs1",
+          "frequency": 1
+        },
+        {
+          "smiles": "CN(CCCN=Cc1cccs1)c1ccccn1",
+          "frequency": 1
+        },
+        {
+          "smiles": "CNC(CCNCc1cccs1)c1ccccn1",
+          "frequency": 1
+        },
+        {
+          "smiles": "CC(N(C)C)N(Cc1cccs1)c1ccccn1",
+          "frequency": 1
+        },
+        {
+          "smiles": "CNCCC(NCc1cccs1)c1ccccn1",
+          "frequency": 1
+        },
+        {
+          "smiles": "CN1CC1CN(Cc1cccs1)c1ccccn1",
+          "frequency": 1
+        }
+      ]
+    },
+    {
+      "spec_id": "CCMSLIB00003138642",
+      "true_canonical_smiles": "NC(CCCCNC(=O)CCC(N)C(=O)O)C(=O)O",
+      "hits": {
+        "1": false,
+        "5": true,
+        "10": true
+      },
+      "n_generated": 100,
+      "n_valid": 100,
+      "n_valid_connected": 100,
+      "n_invalid": 0,
+      "n_disconnected": 0,
+      "ranked_connected_candidates": [
+        {
+          "smiles": "NCCCCC(NC(=O)CCC(N)C(=O)O)C(=O)O",
+          "frequency": 50
+        },
+        {
+          "smiles": "NC(CCCCNC(=O)CCC(N)C(=O)O)C(=O)O",
+          "frequency": 49
+        },
+        {
+          "smiles": "NC(CCCC(NC(=O)C1CCN1)C(=O)O)C(=O)O",
+          "frequency": 1
+        }
+      ]
+    }
+  ]
+}

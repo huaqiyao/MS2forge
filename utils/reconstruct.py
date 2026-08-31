@@ -1,3 +1,4 @@
+
 """
 https://github.com/mattragoza/liGAN/blob/master/fitting.py
 
@@ -496,7 +497,6 @@ def convert_ob_mol_to_rd_mol(ob_mol,struct=None):
 
     for ob_atom in ob.OBMolAtomIter(ob_mol):
         rd_atom = Chem.Atom(ob_atom.GetAtomicNum())
-        #TODO copy format charge
         if ob_atom.IsAromatic() and ob_atom.IsInRing() and ob_atom.MemberOfRingSize() <= 6:
             #don't commit to being aromatic unless rdkit will be okay with the ring status
             #(this can happen if the atoms aren't fit well enough)

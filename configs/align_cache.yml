@@ -1,0 +1,32 @@
+# The current release uses align.pt as a fixed encoder artifact. This config
+# documents the exact encoder/cache contract; it is not an align training config.
+model:
+  align_ckpt_path: ./checkpoints/align.pt
+  contrastive_dim: 512
+  ms_encoder:
+    dim_sos: 13
+    dim_formula: 144
+    hidden_dim: 512
+    num_transformer_layers: 3
+    nhead: 8
+    dropout: 0.1
+    input_dropout: 0.1
+    max_len: 129
+    output_dim: 512
+  graph_encoder:
+    n_layers: 4
+    output_dim: 512
+
+dataset:
+  msg_root: ./data/msg_diffms
+  pretrain_smiles_file: ./data/pretrain/pretrain_smiles.csv
+  cache_dir: ./data/cache
+
+cache:
+  version: v1
+  batch_size: 64
+  dtype: float16
+
+chem:
+  atomic_numbers: [5, 6, 7, 8, 9, 14, 15, 16, 17, 33, 34, 35, 53]
+  mol_bond_types: [1, 2, 3, 4]

@@ -1,0 +1,29 @@
+{
+  "verified": true,
+  "completed_at": "2026-07-11T14:20:30+08:00",
+  "summary": "evaluation/summary_test_n100_T20_r1.0_seed2026_zms_real.json",
+  "candidate_caches_included": false,
+  "candidate_cache_count": 8,
+  "candidate_cache_total_bytes": 489813254,
+  "candidate_cache_files": [
+    "candidate_cache_test_n100_T20_r1.0_seed2026_zms_real_bs16_rank00of8.jsonl",
+    "candidate_cache_test_n100_T20_r1.0_seed2026_zms_real_bs16_rank01of8.jsonl",
+    "candidate_cache_test_n100_T20_r1.0_seed2026_zms_real_bs16_rank02of8.jsonl",
+    "candidate_cache_test_n100_T20_r1.0_seed2026_zms_real_bs16_rank03of8.jsonl",
+    "candidate_cache_test_n100_T20_r1.0_seed2026_zms_real_bs16_rank04of8.jsonl",
+    "candidate_cache_test_n100_T20_r1.0_seed2026_zms_real_bs16_rank05of8.jsonl",
+    "candidate_cache_test_n100_T20_r1.0_seed2026_zms_real_bs16_rank06of8.jsonl",
+    "candidate_cache_test_n100_T20_r1.0_seed2026_zms_real_bs16_rank07of8.jsonl"
+  ],
+  "protocol": {
+    "split": "test",
+    "total_mols": 17530,
+    "n_samples": 100,
+    "n_timesteps": 20,
+    "seed": 2026,
+    "world_size": 8,
+    "eval_mode": "diffms_2d",
+    "condition_mode": "real",
+    "condition_source": "zms"
+  }
+}

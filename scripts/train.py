@@ -1,19 +1,19 @@
-"""
-FLASH训练脚本
-FLASH = Flow-based Learning for Assembly of molecular Structures from MS/MS with formula Hints
-统一使用离散贝叶斯流网络 (Discrete BFN) 生成范式
-支持质谱模式：formula, formula+dreams
-"""
+"""MS2Forge module."""
 
 import os
 import sys
+import time
 import argparse
 import pickle
+from datetime import timedelta
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import random
@@ -24,9 +24,9 @@ from tqdm import tqdm
 from rdkit import Chem
 import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.use('Agg')  # 非交互式后端
+matplotlib.use('Agg')
 
-# 添加项目根目录到路径
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.dataset import get_dataset
@@ -36,14 +36,14 @@ from torch_geometric.transforms import Compose
 
 
 def load_config(config_path):
-    """加载配置文件"""
+    """load_config implementation."""
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return EasyDict(config)
 
 
 def seed_all(seed):
-    """设置随机种子"""
+    """seed_all implementation."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -52,8 +52,149 @@ def seed_all(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def setup_distributed(args):
+    """setup_distributed implementation."""
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    distributed = world_size > 1
+    rank = int(os.environ.get('RANK', '0'))
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    if distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError('DDP training requires CUDA, but torch.cuda.is_available() is False')
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend='nccl', init_method='env://', timeout=timedelta(hours=12))
+        args.device = f'cuda:{local_rank}'
+    return distributed, rank, local_rank, world_size
+
+
+def is_main_process(rank):
+    return rank == 0
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, 'module') else model
+
+
+def ddp_barrier(distributed):
+    if distributed and dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+class NullWriter:
+    def add_scalar(self, *args, **kwargs):
+        pass
+
+    def add_figure(self, *args, **kwargs):
+        pass
+
+    def close(self):
+        pass
+
+
+def wait_for_files(paths, logger, desc, poll_sec=30):
+    """wait_for_files implementation."""
+    paths = list(paths)
+    while not all(os.path.exists(p) for p in paths):
+        missing = [p for p in paths if not os.path.exists(p)]
+        logger.warning(f'{desc}: waiting for filegenerate, missing {missing[:3]}')
+        time.sleep(poll_sec)
+
+
+def expected_smiles_processed_paths(dataset_cfg, atomic_numbers):
+    root = cfg_get(dataset_cfg, 'root', './data/pretrain')
+    smiles_file = cfg_get(dataset_cfg, 'smiles_file', os.path.join(root, 'pretrain_smiles.csv'))
+    max_atoms = cfg_get(dataset_cfg, 'max_atoms', None)
+    data_subset_ratio = float(cfg_get(dataset_cfg, 'data_subset_ratio', 1.0))
+    base = os.path.splitext(os.path.basename(smiles_file))[0]
+    suffix = f"smiles_{base}_max{max_atoms if max_atoms is not None else 'inf'}_atoms{len(list(atomic_numbers))}"
+    if data_subset_ratio < 1.0:
+        suffix += f"_{int(data_subset_ratio * 100)}pct"
+    processed_path = os.path.join(root, f'processed_{suffix}.lmdb')
+    keys_path = processed_path.replace('.lmdb', '_keys.pt')
+    return processed_path, keys_path
+
+
+def cfg_get(cfg, key, default=None):
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+_RELEASE_ADAPTER_KEYS = frozenset({
+    'zms_adapter.0.weight',
+    'zms_adapter.0.bias',
+    'zms_adapter.3.weight',
+    'zms_adapter.3.bias',
+})
+_RELEASE_LEGACY_EDGE_PRECISION_KEYS = frozenset({
+    'edge_precision_head.0.weight',
+    'edge_precision_head.0.bias',
+    'edge_precision_head.2.weight',
+    'edge_precision_head.2.bias',
+})
+
+
+def assert_release_checkpoint_keys(missing, unexpected, context,
+                                   allow_graph_to_ms=False,
+                                   allow_graph_resume=False):
+    """Reject every non-strict checkpoint mismatch outside the release contract."""
+    actual = (frozenset(missing), frozenset(unexpected))
+    allowed = {(frozenset(), frozenset())}
+    if allow_graph_to_ms:
+        allowed.add((_RELEASE_ADAPTER_KEYS, _RELEASE_LEGACY_EDGE_PRECISION_KEYS))
+    if allow_graph_resume:
+        allowed.add((frozenset(), _RELEASE_LEGACY_EDGE_PRECISION_KEYS))
+    if actual not in allowed:
+        raise RuntimeError(
+            f'{context} checkpoint key set does not satisfy  release compatibility contract: '
+            f'missing={sorted(actual[0])}, unexpected={sorted(actual[1])}'
+        )
+
+
+def resolve_condition_indices(batch, batch_size, device, config,
+                              force_mode=None):
+    """Resolve BFN condition labels without silently mixing protocols.
+
+    Stage-II uses index 2 for instrument=NONE and index 0 for
+    ionization=[M+H]+.  ``force_mode`` is used by the fixed teacher; otherwise
+    the student follows ``train.student_condition_mode``.
+    """
+    mode = force_mode or cfg_get(config.train, 'student_condition_mode', 'real')
+    if mode not in ('real', 'default'):
+        raise ValueError(f'student_condition_mode must be one of  real/default, ; received  {mode!r}')
+    if mode == 'default':
+        instrument_default = int(cfg_get(config.train, 'default_instrument_idx', 2))
+        ionization_default = int(cfg_get(config.train, 'default_ionization_idx', 0))
+        return (
+            torch.full((batch_size,), instrument_default, dtype=torch.long, device=device),
+            torch.full((batch_size,), ionization_default, dtype=torch.long, device=device),
+        )
+    instrument = (
+        batch.instrument_type_idx_batch.to(device)
+        if getattr(batch, 'instrument_type_idx_batch', None) is not None
+        else torch.zeros(batch_size, dtype=torch.long, device=device)
+    )
+    ionization = (
+        batch.ionization_type_idx_batch.to(device)
+        if getattr(batch, 'ionization_type_idx_batch', None) is not None
+        else torch.zeros(batch_size, dtype=torch.long, device=device)
+    )
+    return instrument, ionization
+
+
+def limit_dataset(dataset, max_samples, seed):
+    if max_samples is None or max_samples <= 0 or max_samples >= len(dataset):
+        return dataset
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    indices = torch.randperm(len(dataset), generator=generator)[:max_samples].tolist()
+    return torch.utils.data.Subset(dataset, indices)
+
+
 def get_logger(name, log_dir=None):
-    """获取logger"""
+    """get_logger implementation."""
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter('[%(asctime)s::%(name)s::%(levelname)s] %(message)s')
@@ -73,30 +214,15 @@ def get_logger(name, log_dir=None):
 
 
 def create_model(config, num_node_types, num_edge_types, atomic_numbers):
-    """创建FLASH模型"""
+    """create_model implementation."""
     from models.model import FLASH
     model = FLASH(config.model, num_node_types, num_edge_types, atomic_numbers)
     return model, None
 
 
 def _permute_nodes_within_batch(node_type, halfedge_index, batch_node, device):
-    """对 batch 内每个分子的节点做独立随机置换。
-    halfedge_index 同步更新，确保边连接关系不变。
+    """_permute_nodes_within_batch implementation."""
 
-    参考思路：图对比学习常用的"节点重排"增强（MolCLR 类似 atom_mask 思路的对称变形）。
-    GNN 理论上置换等变，但浮点 + mean_pool 数值上仍有微小差异；
-    每次见到不同的节点序列，迫使 graph_encoder 学到真正的不变表征，防止记住特定顺序。
-
-    Args:
-        node_type      : [N_total]  当前 batch 拼好的节点类型
-        halfedge_index : [2, M_total]  半边索引
-        batch_node     : [N_total]  每个节点属于哪个图
-        device         : torch.device
-
-    Returns:
-        new_node_type, new_halfedge_index, batch_node（不变）
-    """
-    # 构造 old_idx → new_idx 映射
     perm_map = torch.arange(node_type.size(0), device=device)
     n_graphs = int(batch_node.max().item()) + 1
     for g in range(n_graphs):
@@ -106,160 +232,54 @@ def _permute_nodes_within_batch(node_type, halfedge_index, batch_node, device):
         shuffled = mask[torch.randperm(mask.numel(), device=device)]
         perm_map[mask] = shuffled
 
-    # 应用到 node_type：new_node_type[new_idx] = node_type[old_idx]
-    # 等价于 new_node_type = node_type 然后按 perm_map 重排
-    # 这里 perm_map 是"old → new"，所以 new_pos_of_old = perm_map
-    # → 让 new_node_type[perm_map[i]] = node_type[i]
+
+
+
+
     new_node_type = torch.empty_like(node_type)
     new_node_type[perm_map] = node_type
 
-    # halfedge_index 也按 perm_map 重映射
+
     new_halfedge_index = perm_map[halfedge_index]
 
     return new_node_type, new_halfedge_index, batch_node
 
 
+
 def train_flash(model, batch, device, config, iteration=None, logger=None):
-    """FLASH 训练步骤（DeniMS 风格三阶段）。
-
-    按 model.stage 分支：
-      - align     : 双塔 InfoNCE，不跑 BFN
-      - graph2mol : graph_encoder(mol) → 256 维条件 → BFN 边去噪
-      - ms2mol    : ms_encoder(DreaMS) → 256 维条件 → BFN 边去噪
-    """
+    """train_flash implementation."""
     batch = batch.to(device)
+    model_core = unwrap_model(model)
     stage = getattr(config.model, 'stage', None)
-    if stage not in ('align', 'graph2mol', 'ms2mol'):
-        raise ValueError(f"model.stage 必须是 align/graph2mol/ms2mol，得到 {stage!r}")
+    if stage not in ('graph2mol', 'ms2mol', 'joint'):
+        raise ValueError(f"model.stage must be one of  graph2mol/ms2mol/joint, ; received  {stage!r}")
 
     # ============================================================
-    # align 阶段：DeniMS 风格双塔 InfoNCE
-    # 输入：(spec_sos, spec_formula_array, spec_mask) + (dense_X, dense_E, dense_y, dense_node_mask)
-    # ============================================================
-    if stage == 'align':
-        if not hasattr(batch, 'spec_sos') or batch.spec_sos is None:
-            raise ValueError("align 阶段需要 batch.spec_sos / spec_formula_array / spec_mask")
 
-        n_total = batch.num_graphs
-
-        # ============================================================
-        # ★ 反过拟合开关（仅 align 阶段）★
-        # ============================================================
-        aug_cfg = getattr(config.train, 'augment', None) or {}
-        aug_get = aug_cfg.get if hasattr(aug_cfg, 'get') else (lambda k, d=None: getattr(aug_cfg, k, d))
-
-        spec_sos = batch.spec_sos
-        spec_formula_array = batch.spec_formula_array
-        spec_mask = batch.spec_mask
-        dense_X = batch.dense_X
-        dense_E = batch.dense_E
-        dense_y = batch.dense_y
-        dense_node_mask = batch.dense_node_mask
-
-        # 谱端高斯噪声（对 formula_array 全张量加扰动）
-        spec_noise_sigma = float(aug_get('spec_noise_sigma', 0.0))
-        if spec_noise_sigma > 0 and model.training:
-            spec_formula_array = spec_formula_array + torch.randn_like(spec_formula_array) * spec_noise_sigma
-
-        out = model(
-            spec_sos=spec_sos,
-            spec_formula_array=spec_formula_array,
-            spec_mask=spec_mask,
-            dense_X=dense_X,
-            dense_E=dense_E,
-            dense_y=dense_y,
-            dense_node_mask=dense_node_mask,
-        )
-
-        # ---- 方案 1: 多正样本 InfoNCE（参考 SupContrast）----
-        positive_mask = None
-        multi_positive = bool(getattr(config.train, 'multi_positive', False))
-        if multi_positive and hasattr(batch, 'smiles') and batch.smiles is not None:
-            smi_list = batch.smiles
-            B = len(smi_list)
-            if B == n_total:
-                positive_mask = torch.zeros(B, B, dtype=torch.float32, device=device)
-                from collections import defaultdict
-                buckets = defaultdict(list)
-                for i, s in enumerate(smi_list):
-                    buckets[s].append(i)
-                for idxs in buckets.values():
-                    for i in idxs:
-                        for j in idxs:
-                            positive_mask[i, j] = 1.0
-
-        loss_main = model.compute_contrastive_loss(
-            out['ms_emb'], out['graph_emb'], positive_mask=positive_mask,
-        )
-
-        # ---- 方案 8: MixCo 风格 mixup ----
-        mixup_alpha = float(getattr(config.train, 'mixup_alpha', 0.0))
-        mixup_weight = float(getattr(config.train, 'mixup_weight', 0.5))
-        loss_mix = torch.zeros((), device=device)
-        if mixup_alpha > 0 and model.training:
-            loss_mix = model.compute_mixup_contrastive_loss(
-                out['ms_emb'], out['graph_emb'], alpha=mixup_alpha,
-            )
-            loss = loss_main + mixup_weight * loss_mix
-        else:
-            loss = loss_main
-
-        if iteration is not None and iteration < 10 and logger is not None:
-            extra = ''
-            if positive_mask is not None:
-                n_pos_per = positive_mask.sum(1).mean().item()
-                extra += f', avg_positives_per_anchor={n_pos_per:.2f}'
-            if mixup_alpha > 0:
-                extra += f', mixup_loss={loss_mix.item():.4f}'
-            logger.info(f"[Iter {iteration}] align contrastive: loss_main={loss_main.item():.4f}, "
-                        f"temperature={1.0/model.inv_temperature.item():.2f}{extra}")
-
-        return {
-            'loss': loss,
-            'contrastive_loss': loss_main.detach(),
-            'mixup_loss': loss_mix.detach() if torch.is_tensor(loss_mix) else loss_mix,
-            'inv_temperature': model.inv_temperature.detach(),
-            '_edge_types_true': torch.zeros(0, dtype=torch.long, device=device),
-            '_batch_edge': torch.zeros(0, dtype=torch.long, device=device),
-        }
 
     # ============================================================
-    # graph2mol / ms2mol：BFN 边去噪
-    # graph2mol 走 SmilesDataset（无谱）→ batch 是 PyG Batch
-    # ms2mol    走 DiffMSMSGDataset → batch 是 SimpleNamespace（含 spec_* 和 dense_*）
-    # ============================================================
+    if not hasattr(batch, 'cond_emb_cached') or batch.cond_emb_cached is None:
+        raise ValueError(f"{stage} stage batch missing cond_emb_cached(from  align ckpt generated offline  cache)")
+
     batch_size = batch.num_graphs if hasattr(batch, 'num_graphs') else (batch.node_type_batch.max().item() + 1)
 
-    # 仪器/ionization 条件（DiffMSMSGDataset 返回 [B] tensor，SmilesDataset 返回 [B]）
-    if hasattr(batch, 'instrument_type_idx_batch') and batch.instrument_type_idx_batch is not None:
-        instrument_type_idx = batch.instrument_type_idx_batch.to(device)
-    else:
-        instrument_type_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
-    if hasattr(batch, 'ionization_type_idx_batch') and batch.ionization_type_idx_batch is not None:
-        ionization_type_idx = batch.ionization_type_idx_batch.to(device)
-    else:
-        ionization_type_idx = torch.zeros(batch_size, dtype=torch.long, device=device)
+    instrument_type_idx, ionization_type_idx = resolve_condition_indices(
+        batch, batch_size, device, config
+    )
 
-    # 准备 forward kwargs：graph2mol/ms2mol 都直接用预算好的 cond_emb_cached
-    # （collate factory 已把 zmol/zms cache 注入到 batch.cond_emb_cached）
-    if not hasattr(batch, 'cond_emb_cached') or batch.cond_emb_cached is None:
-        raise ValueError(
-            f"{stage} 阶段 batch 缺 cond_emb_cached。请确认用了 make_smiles_collate_with_cache "
-            f"或 make_msg_diffms_collate_with_cache。"
-        )
-    fwd_kwargs = {'cond_emb_cached': batch.cond_emb_cached}
 
-    # 采样时间 + BFN 后验
     t = torch.rand(batch_size, device=device)
     edge_types_true = batch.halfedge_type
-    theta = model.discrete_bayesian_update(t, edge_types_true, batch.halfedge_type_batch)
+    theta = model_core.discrete_bayesian_update(
+        t, edge_types_true, batch.halfedge_type_batch
+    )
 
     if iteration is not None and iteration < 10 and logger is not None:
-        logger.info(f"[Iter {iteration}] {stage} BFN 调试:")
-        logger.info(f"  - 时间t范围: [{t.min().item():.3f}, {t.max().item():.3f}]")
-        logger.info(f"  - theta 熵: {-(theta * theta.clamp(min=1e-8).log()).sum(-1).mean().item():.4f}")
+        logger.info(f"[Iter {iteration}] {stage} BFN: "
+                    f"t∈[{t.min().item():.3f}, {t.max().item():.3f}], "
+                    f"theta entropy={-(theta * theta.clamp(min=1e-8).log()).sum(-1).mean().item():.4f}")
 
-    # 前向（cond_emb 来源在 model.forward 内部按 stage 自动分流）
+
     e_hat = model(
         node_types=batch.node_type,
         edge_index=batch.halfedge_index,
@@ -270,51 +290,58 @@ def train_flash(model, batch, device, config, iteration=None, logger=None):
         t=t,
         edge_types_t=torch.zeros_like(edge_types_true),
         edge_theta=theta,
-        **fwd_kwargs,
+        cond_emb_cached=batch.cond_emb_cached,
     )
 
-    losses = model.compute_bfn_loss(e_hat, edge_types_true, t, batch.halfedge_type_batch)
+    losses = model_core.compute_bfn_loss(
+        e_hat, edge_types_true, t, batch.halfedge_type_batch
+    )
     total_loss = losses['total']
+
     loss_dict = {k: v for k, v in losses.items()}
     loss_dict['loss'] = total_loss
     loss_dict['_edge_types_true'] = edge_types_true.detach()
     loss_dict['_batch_edge'] = batch.halfedge_type_batch.detach()
+    loss_dict['_edge_logits'] = e_hat
+    loss_dict['_edge_raw_logits'] = getattr(model_core, '_last_x0_logits', None)
+    loss_dict['_t'] = t.detach()
+    loss_dict['_theta'] = theta.detach()
     return loss_dict
 
 
 def print_first_iter_debug(batch, config, logger):
-    """第一个iteration时打印调试信息"""
+    """print_first_iter_debug implementation."""
     import random as rand
 
     logger.info("=" * 60)
-    logger.info("[DEBUG] 第一个iteration调试信息")
+    logger.info("[DEBUG] First-iteration diagnostics")
     logger.info("=" * 60)
 
     has_spectrum = hasattr(batch, 'batch_has_spectrum') and batch.batch_has_spectrum
     has_mask = hasattr(batch, 'has_spectrum_mask') and batch.has_spectrum_mask.any()
     has_embedding = hasattr(batch, 'pretrained_embedding_batch') and batch.pretrained_embedding_batch is not None
 
-    logger.info(f"[质谱特征检查]")
+    logger.info(f"[Spectrum-feature check]")
     logger.info(f"  - batch_has_spectrum: {has_spectrum}")
     logger.info(f"  - has_spectrum_mask: {has_mask}")
-    logger.info(f"  - pretrained_embedding_batch存在: {has_embedding}")
+    logger.info(f"  - pretrained_embedding_batch available: {has_embedding}")
 
     if has_embedding:
         emb = batch.pretrained_embedding_batch
-        logger.info(f"  - pretrained_embedding_batch形状: {emb.shape}")
-        logger.info(f"  - pretrained_embedding_batch范围: [{emb.min().item():.4f}, {emb.max().item():.4f}]")
+        logger.info(f"  - pretrained_embedding_batch shape: {emb.shape}")
+        logger.info(f"  - pretrained_embedding_batch range: [{emb.min().item():.4f}, {emb.max().item():.4f}]")
 
-    logger.info(f"[分子式/节点类型检查]")
-    logger.info(f"  - node_type形状: {batch.node_type.shape}")
-    logger.info(f"  - node_type唯一值: {batch.node_type.unique().tolist()}")
-    logger.info(f"  - 分子数量: {batch.num_graphs}")
+    logger.info("[Molecular formula and node-type check]")
+    logger.info(f"  - node_type shape: {batch.node_type.shape}")
+    logger.info(f"  - node_type unique values: {batch.node_type.unique().tolist()}")
+    logger.info(f"  - Molecule count: {batch.num_graphs}")
 
-    logger.info(f"[训练标签检查]")
-    logger.info(f"  - halfedge_type形状: {batch.halfedge_type.shape}")
-    logger.info(f"  - halfedge_type唯一值: {batch.halfedge_type.unique().tolist()}")
+    logger.info("[Training-label check]")
+    logger.info(f"  - halfedge_type shape: {batch.halfedge_type.shape}")
+    logger.info(f"  - halfedge_type unique values: {batch.halfedge_type.unique().tolist()}")
 
     mol_idx = rand.randint(0, batch.num_graphs - 1)
-    logger.info(f"[随机分子 #{mol_idx} 详细信息]")
+    logger.info(f"[Random molecule #{mol_idx} details]")
 
     mol_node_mask = (batch.node_type_batch == mol_idx)
     mol_nodes = batch.node_type[mol_node_mask]
@@ -330,40 +357,30 @@ def print_first_iter_debug(batch, config, logger):
             formula_counts[symbol] = formula_counts.get(symbol, 0) + 1
 
     formula_str = ''.join([f"{sym}{cnt}" if cnt > 1 else sym for sym, cnt in sorted(formula_counts.items())])
-    logger.info(f"  - 分子式: {formula_str}")
-    logger.info(f"  - 原子数: {mol_nodes.shape[0]}")
+    logger.info(f"  - Molecular formula: {formula_str}")
+    logger.info(f"  - Atom count: {mol_nodes.shape[0]}")
 
     logger.info("=" * 60)
 
 
-def evaluate_reconstruction(model, val_dataset, device, config, mode, atomic_numbers, logger, collate_fn, num_samples=100):
-    """
-    评估模型：按 stage 分支
-      - align     : 算 pairwise matching top-1 accuracy + mean cos similarity（不跑 BFN 采样）
-      - graph2mol : BFN 采样评估（用 graph_encoder(mol) 当条件，与训练时一致）
-      - ms2mol    : BFN 采样评估（用 ms_encoder(DreaMS) 当条件）
-
-    Args:
-        model: 训练的模型
-        val_dataset: 验证集Dataset（或Subset）
-        device: 设备
-        config: 配置
-        mode: 模型模式
-        atomic_numbers: 原子类型列表
-        logger: 日志器
-        collate_fn: collate函数
-        num_samples: 每个样本生成的结果数量（默认100；align 阶段不使用）
-
-    Returns:
-        dict: 包含准确率的字典
-    """
+def evaluate_reconstruction(model, val_dataset, device, config, mode, atomic_numbers, logger,
+                            collate_fn, num_samples=100, distributed=False, rank=0,
+                            world_size=1, eval_iteration=None):
+    """evaluate_reconstruction implementation."""
+    model = unwrap_model(model)
     model.eval()
     stage = getattr(config.model, 'stage', None)
+    log_enabled = (not distributed) or rank == 0
 
-    # 读取评估专用的batch size
+
     eval_batch_size = config.train.get('eval_batch_size', 4)
+    if distributed:
+        local_indices = list(range(rank, len(val_dataset), world_size))
+        eval_dataset = torch.utils.data.Subset(val_dataset, local_indices)
+    else:
+        eval_dataset = val_dataset
     eval_loader = DataLoader(
-        val_dataset,
+        eval_dataset,
         batch_size=eval_batch_size,
         shuffle=False,
         num_workers=0,
@@ -371,82 +388,20 @@ def evaluate_reconstruction(model, val_dataset, device, config, mode, atomic_num
     )
 
     # ============================================================
-    # align 阶段：双塔 pairwise matching 评估
     # ============================================================
-    if stage == 'align':
-        logger.info(f'[align 评估] eval_batch_size={eval_batch_size}, 总样本数={len(val_dataset)}')
-        all_ms_emb = []
-        all_graph_emb = []
-        with torch.no_grad():
-            for batch in tqdm(eval_loader, desc='align 评估', leave=False, position=0):
-                batch = batch.to(device)
-                if not (hasattr(batch, 'batch_has_spectrum') and batch.batch_has_spectrum):
-                    continue
-                if not (hasattr(batch, 'pretrained_embedding_batch')
-                        and batch.pretrained_embedding_batch is not None):
-                    continue
-                # 仅取带谱样本
-                has_mask = batch.has_spectrum_mask
-                n_total = batch.node_type_batch.max().item() + 1
-                if int(has_mask.sum().item()) != n_total:
-                    continue   # 跳过混合 batch（与训练逻辑一致）
-                emb = batch.pretrained_embedding_batch[has_mask].to(device)
-                if emb.dim() == 3:
-                    emb = emb.squeeze(1)
-
-                out = model(
-                    node_types=batch.node_type,
-                    edge_index=batch.halfedge_index,
-                    batch_node=batch.node_type_batch,
-                    batch_edge=batch.halfedge_type_batch,
-                    pretrained_embedding=emb,
-                )
-                all_ms_emb.append(out['ms_emb'].cpu())
-                all_graph_emb.append(out['graph_emb'].cpu())
-
-        if not all_ms_emb:
-            logger.warning('[align 评估] 验证集没有可用的样本，跳过')
-            return {'pairwise_top1': 0.0, 'cos_sim_mean': 0.0,
-                    'edge_accuracy': 0.0, 'bond_accuracy': 0.0, 'mol_accuracy': 0.0}
-
-        ms_embs = torch.cat(all_ms_emb, dim=0)             # [N, D]
-        graph_embs = torch.cat(all_graph_emb, dim=0)
-        ms_embs = F.normalize(ms_embs, dim=-1)
-        graph_embs = F.normalize(graph_embs, dim=-1)
-
-        N = ms_embs.size(0)
-        # 全集 pairwise matching：对每个 ms_emb_i，看 graph_emb_i 是否是其最近邻
-        # 注意大集合上是 N×N 相似度，N 可能很大，做分块计算
-        chunk = 256
-        top1_correct = 0
-        for s in range(0, N, chunk):
-            sim_chunk = ms_embs[s:s+chunk] @ graph_embs.t()  # [c, N]
-            preds = sim_chunk.argmax(dim=-1)                 # 最近邻
-            target = torch.arange(s, s + sim_chunk.size(0))
-            top1_correct += (preds == target).sum().item()
-        pairwise_top1 = top1_correct / max(N, 1)
-
-        # 自身配对的 cos similarity 平均
-        cos_sim_mean = (ms_embs * graph_embs).sum(-1).mean().item()
-
-        logger.info(f'[align 评估] 验证集统计:')
-        logger.info(f'  样本数 N = {N}')
-        logger.info(f'  pairwise top-1 accuracy = {pairwise_top1:.4f}')
-        logger.info(f'  mean cosine similarity  = {cos_sim_mean:.4f}')
-
-        return {
-            'pairwise_top1': pairwise_top1,
-            'cos_sim_mean': cos_sim_mean,
-            # 兼容主训练循环里看的字段
-            'edge_accuracy': 0.0,
-            'bond_accuracy': 0.0,
-            'mol_accuracy': 0.0,
-        }
 
     # ============================================================
-    # graph2mol / ms2mol：BFN 采样评估
-    # ============================================================
-    logger.info(f'评估配置: eval_batch_size={eval_batch_size}, num_samples={num_samples}, 总样本数={len(val_dataset)}')
+    if eval_iteration is not None:
+        eval_seed = int(config.train.get('seed', 0)) + int(eval_iteration) * 1009 + rank * 1000003
+        torch.manual_seed(eval_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(eval_seed)
+    if log_enabled:
+        logger.info(
+            f'Evaluation configuration: eval_batch_size={eval_batch_size}, num_samples={num_samples}, '
+            f'total samples={len(val_dataset)}, local-rank samples={len(eval_dataset)}, '
+            f'world_size={world_size if distributed else 1}'
+        )
 
     total_correct = 0
     total_edges = 0
@@ -455,40 +410,40 @@ def evaluate_reconstruction(model, val_dataset, device, config, mode, atomic_num
     mol_exact_match = 0
     total_mols = 0
 
-    # Top-K 统计（仅当 num_samples > 1 且为生成模型时使用）
+
     top1_correct_count = 0
     top10_correct_count = 0
 
     with torch.no_grad():
-        batch_pbar = tqdm(eval_loader, desc='评估验证集', leave=False, position=0)
+        batch_pbar = tqdm(
+            eval_loader,
+            desc='Evaluating validation set' if not distributed else f'Evaluating validation set rank{rank}',
+            leave=False,
+            position=0,
+            disable=distributed and rank != 0,
+        )
         for batch_idx, batch in enumerate(batch_pbar):
+            if batch is None:
+                continue
             batch = batch.to(device)
 
-            # graph2mol/ms2mol 都用 batch.cond_emb_cached（由 cache-version collate 注入）
-            if not hasattr(batch, 'cond_emb_cached') or batch.cond_emb_cached is None:
-                logger.warning(f"  评估 batch 缺 cond_emb_cached，跳过")
-                continue
-            cond_emb_cached = batch.cond_emb_cached.to(device)
-            batch_size_orig = cond_emb_cached.size(0)
 
-            # 仪器/ionization：ms2mol 从 batch 取；graph2mol 全 0
-            if stage == 'ms2mol':
-                instrument_type_idx = batch.instrument_type_idx_batch.to(device) \
-                    if hasattr(batch, 'instrument_type_idx_batch') and batch.instrument_type_idx_batch is not None \
-                    else torch.zeros(batch_size_orig, dtype=torch.long, device=device)
-                ionization_type_idx = batch.ionization_type_idx_batch.to(device) \
-                    if hasattr(batch, 'ionization_type_idx_batch') and batch.ionization_type_idx_batch is not None \
-                    else torch.zeros(batch_size_orig, dtype=torch.long, device=device)
-            else:  # graph2mol
-                instrument_type_idx = torch.zeros(batch_size_orig, dtype=torch.long, device=device)
-                ionization_type_idx = torch.zeros(batch_size_orig, dtype=torch.long, device=device)
+
+            if not hasattr(batch, 'cond_emb_cached') or batch.cond_emb_cached is None:
+                if log_enabled:
+                    logger.warning("Evaluation batch has no cond_emb_cached tensor; skipping")
+                continue
+            batch_size_orig = batch.cond_emb_cached.size(0)
+
+            instrument_type_idx, ionization_type_idx = resolve_condition_indices(
+                batch, batch_size_orig, device, config
+            )
 
             edge_types_true = batch.halfedge_type
-
             num_nodes = batch.node_type.shape[0]
             num_edges = batch.halfedge_index.shape[1]
 
-            # 将输入扩展 num_samples 倍
+
             node_types_expanded = batch.node_type.repeat(num_samples)
             edge_index_expanded = batch.halfedge_index.repeat(1, num_samples)
             for i in range(1, num_samples):
@@ -500,10 +455,10 @@ def evaluate_reconstruction(model, val_dataset, device, config, mode, atomic_num
             instrument_type_idx_expanded = instrument_type_idx.repeat(num_samples)
             ionization_type_idx_expanded = ionization_type_idx.repeat(num_samples)
 
-            # 扩展 cond_emb_cached （每个样本复制 num_samples 次）
-            cond_emb_expanded = cond_emb_cached.repeat(num_samples, 1)   # [num_samples * B, 512]
+            sample_extra = {
+                'cond_emb_cached': batch.cond_emb_cached.to(device).repeat(num_samples, 1),
+            }
 
-            # BFN 采样（用 cond_emb_cached 而不是 pretrained_embedding）
             pred_edge_types_all = model.sample_bfn(
                 node_types=node_types_expanded,
                 edge_index=edge_index_expanded,
@@ -511,58 +466,126 @@ def evaluate_reconstruction(model, val_dataset, device, config, mode, atomic_num
                 batch_edge=batch_edge_expanded,
                 instrument_type_idx=instrument_type_idx_expanded,
                 ionization_type_idx=ionization_type_idx_expanded,
-                cond_emb_cached=cond_emb_expanded,
                 n_timesteps=config.model.flow.get('eval_n_timesteps', 100),
-                disable_tqdm=False
+                disable_tqdm=False,
+                **sample_extra,
             )
 
-            # 将结果拆分回 num_samples 个独立预测
+
             all_predictions = []
             for i in range(num_samples):
                 pred_edge_types = pred_edge_types_all[i*num_edges:(i+1)*num_edges]
                 all_predictions.append(pred_edge_types)
 
-            # 更新外层进度条
-            batch_pbar.set_postfix({'已处理分子': total_mols})
 
-            # 使用第一个预测计算 TotalAcc 和 BondAcc
             pred_edge_types = all_predictions[0]
 
-            # 累计TotalAcc
+
             total_correct += (pred_edge_types == edge_types_true).sum().item()
             total_edges += edge_types_true.numel()
 
-            # 累计BondAcc
+
             bond_mask = edge_types_true > 0
             bond_correct += ((pred_edge_types == edge_types_true) & bond_mask).sum().item()
             total_bonds += bond_mask.sum().item()
 
-            # 累计MolAcc（遍历该batch的每个分子）
+
+            eval_mode = config.train.get('eval_mode', 'strict')
             num_mols_in_batch = batch.halfedge_type_batch.max().item() + 1
+            chem_eval = eval_mode in ('isomorphic', 'inchikey', 'diffms_inchi', 'diffms_2d')
+
+            if chem_eval and batch_idx == 0:
+                if log_enabled:
+                    metric_name_map = {
+                        'inchikey': 'InChIKey',
+                        'diffms_inchi': 'DiffMS valid-connected InChI',
+                        'diffms_2d': 'DiffMS valid-connected non-isomeric canonical SMILES',
+                    }
+                    metric_name = metric_name_map.get(eval_mode, 'RDKit canonical SMILES')
+                    logger.info(f'   eval_mode={eval_mode}: using  {metric_name} comparison '
+                                f'(this timesevaluation {len(val_dataset)}  molecules; ground truth uses  batch.smiles convert directly, '
+                                f'one predictive reconstruction pass Mol, total  ~{len(val_dataset)} times RDKit reconstruction)')
+            n_iso_done_this_batch = 0
+            n_iso_sanitize_fail = 0
+            iso_t0 = time.time() if chem_eval else None
             for mol_idx in range(num_mols_in_batch):
                 mol_mask = batch.halfedge_type_batch == mol_idx
                 if mol_mask.sum() > 0:
                     mol_pred = pred_edge_types[mol_mask]
                     mol_true = edge_types_true[mol_mask]
-                    is_match = (mol_pred == mol_true).all()
+
+                    if chem_eval:
+                        from utils.eval_utils import (
+                            edges_to_canonical_smiles,
+                            edges_to_diffms_2d,
+                            edges_to_diffms_inchi,
+                            edges_to_inchikey,
+                            mol_to_diffms_2d,
+                        )
+                        node_mask = batch.node_type_batch == mol_idx
+                        nt = batch.node_type[node_mask].cpu()
+
+                        he_full = batch.halfedge_index[:, mol_mask].cpu()
+                        node_off = node_mask.nonzero(as_tuple=True)[0][0].item()
+                        he_local = he_full - node_off
+                        if eval_mode == 'inchikey':
+                            pred_repr = edges_to_inchikey(nt, he_local, mol_pred.cpu(), atomic_numbers)
+                        elif eval_mode == 'diffms_inchi':
+                            pred_repr = edges_to_diffms_inchi(nt, he_local, mol_pred.cpu(), atomic_numbers)
+                        elif eval_mode == 'diffms_2d':
+                            pred_repr = edges_to_diffms_2d(nt, he_local, mol_pred.cpu(), atomic_numbers)
+                        else:
+                            pred_repr = edges_to_canonical_smiles(nt, he_local, mol_pred.cpu(), atomic_numbers)
+
+                        from rdkit import Chem
+                        true_raw = batch.smiles[mol_idx] if hasattr(batch, 'smiles') else None
+                        if true_raw:
+                            try:
+                                _m = Chem.MolFromSmiles(true_raw)
+                                if eval_mode == 'inchikey':
+                                    true_repr = Chem.MolToInchiKey(_m) if _m else None
+                                elif eval_mode == 'diffms_inchi':
+                                    true_repr = Chem.MolToInchi(_m) if _m else None
+                                elif eval_mode == 'diffms_2d':
+                                    true_repr = mol_to_diffms_2d(_m)
+                                else:
+                                    true_repr = Chem.MolToSmiles(_m, canonical=True) if _m else None
+                            except Exception:
+                                true_repr = None
+                        else:
+
+                            if eval_mode == 'inchikey':
+                                true_repr = edges_to_inchikey(nt, he_local, mol_true.cpu(), atomic_numbers)
+                            elif eval_mode == 'diffms_inchi':
+                                true_repr = edges_to_diffms_inchi(nt, he_local, mol_true.cpu(), atomic_numbers)
+                            elif eval_mode == 'diffms_2d':
+                                true_repr = edges_to_diffms_2d(nt, he_local, mol_true.cpu(), atomic_numbers)
+                            else:
+                                true_repr = edges_to_canonical_smiles(nt, he_local, mol_true.cpu(), atomic_numbers)
+                        is_match = (pred_repr is not None and true_repr is not None and pred_repr == true_repr)
+                        n_iso_done_this_batch += 1
+                        if pred_repr is None:
+                            n_iso_sanitize_fail += 1
+                    else:
+                        is_match = (mol_pred == mol_true).all().item()
 
                     if is_match:
                         mol_exact_match += 1
 
-                    # ========== Top-K 计算（仅当 num_samples > 1 且为生成模型时）==========
+
                     if num_samples > 1:
-                        # 收集该分子的所有预测序列（保持在 GPU 上）
+
                         mol_predictions_gpu = []
                         for pred_single in all_predictions:
                             mol_pred_single = pred_single[mol_mask]
                             mol_predictions_gpu.append(mol_pred_single)
 
-                        # 使用 GPU 加速的唯一性检测
+
                         unique_predictions = []
                         unique_counts = []
 
                         for pred in mol_predictions_gpu:
-                            # 检查是否已存在
+
                             found = False
                             for i, unique_pred in enumerate(unique_predictions):
                                 if torch.equal(pred, unique_pred):
@@ -573,44 +596,44 @@ def evaluate_reconstruction(model, val_dataset, device, config, mode, atomic_num
                                 unique_predictions.append(pred)
                                 unique_counts.append(1)
 
-                        # 按频率排序
+
                         sorted_indices = sorted(range(len(unique_counts)), key=lambda i: unique_counts[i], reverse=True)
 
-                        # 计算 Top-1 和 Top-10
+
                         n_unique_predictions = len(unique_predictions)
                         top1_frequency = unique_counts[sorted_indices[0]] if len(sorted_indices) > 0 else 0
 
-                        # 检查真实序列是否在 top-1 和 top-10 中
+
                         top1_match = False
                         top10_match = False
 
                         if len(sorted_indices) > 0:
-                            # Top-1 逻辑：如果最高频率是1（所有预测都不同），检查所有预测中是否有匹配
+
                             if top1_frequency == 1:
-                                # 所有预测都不同，检查是否有任何一个匹配
+
                                 for unique_pred in unique_predictions:
                                     if torch.equal(unique_pred, mol_true):
                                         top1_match = True
                                         break
                             else:
-                                # 有重复预测，只检查频率最高的
+
                                 top1_match = torch.equal(unique_predictions[sorted_indices[0]], mol_true)
 
-                            # Top-10 逻辑：如果有>=10个唯一预测且最高频率是1，检查所有预测；否则检查频率最高的前10个
+
                             if n_unique_predictions >= 10 and top1_frequency == 1:
-                                # 有10个或更多不同预测，检查所有预测中是否有匹配
+
                                 for unique_pred in unique_predictions:
                                     if torch.equal(unique_pred, mol_true):
                                         top10_match = True
                                         break
                             else:
-                                # 预测数量<10 或有重复，检查频率最高的前10个
+
                                 for idx in sorted_indices[:min(10, len(sorted_indices))]:
                                     if torch.equal(unique_predictions[idx], mol_true):
                                         top10_match = True
                                         break
 
-                        # 累计 Top-K 统计
+
                         if top1_match:
                             top1_correct_count += 1
                         if top10_match:
@@ -618,23 +641,58 @@ def evaluate_reconstruction(model, val_dataset, device, config, mode, atomic_num
 
                     total_mols += 1
 
-    # 计算最终指标
+
+            if chem_eval and log_enabled:
+                iso_dt = time.time() - iso_t0 if iso_t0 else 0
+                logger.info(f"  [batch {batch_idx+1}/{len(eval_loader)}] "
+                            f"RDKit reconstructed {n_iso_done_this_batch} molecules ({iso_dt:.2f}s; "
+                            f"sanitize failures={n_iso_sanitize_fail}); cumulative={total_mols}")
+                batch_pbar.set_postfix({
+                    'molecule': total_mols,
+                    'RDKit failures': f'{n_iso_sanitize_fail}/{n_iso_done_this_batch}',
+                    f'{iso_dt:.1f}s/batch': '',
+                })
+
+    if distributed:
+        metrics_tensor = torch.tensor([
+            float(total_correct),
+            float(total_edges),
+            float(bond_correct),
+            float(total_bonds),
+            float(mol_exact_match),
+            float(total_mols),
+            float(top1_correct_count),
+            float(top10_correct_count),
+        ], dtype=torch.float64, device=device)
+        dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
+        total_correct = int(metrics_tensor[0].item())
+        total_edges = int(metrics_tensor[1].item())
+        bond_correct = int(metrics_tensor[2].item())
+        total_bonds = int(metrics_tensor[3].item())
+        mol_exact_match = int(metrics_tensor[4].item())
+        total_mols = int(metrics_tensor[5].item())
+        top1_correct_count = int(metrics_tensor[6].item())
+        top10_correct_count = int(metrics_tensor[7].item())
+
+
     total_acc = total_correct / total_edges if total_edges > 0 else 0
     bond_acc = bond_correct / total_bonds if total_bonds > 0 else 0
     mol_acc = mol_exact_match / total_mols if total_mols > 0 else 0
 
-    logger.info(f"[评估] 验证集统计:")
-    logger.info(f"  总边数: {total_edges}, 总分子数: {total_mols}")
-    logger.info(f"  TotalAcc: {total_acc:.4f}")
-    logger.info(f"  BondAcc: {bond_acc:.4f}")
-    logger.info(f"  MolAcc: {mol_exact_match}/{total_mols} = {mol_acc:.4f}")
+    if log_enabled:
+        logger.info(f"[evaluation] validationset statistics:")
+        logger.info(f"  total edges: {total_edges}, totalmoleculecount: {total_mols}")
+        logger.info(f"  TotalAcc: {total_acc:.4f}")
+        logger.info(f"  BondAcc: {bond_acc:.4f}")
+        logger.info(f"  MolAcc: {mol_exact_match}/{total_mols} = {mol_acc:.4f}")
 
-    # 如果 num_samples > 1 且为生成模型，输出 Top-K 准确率
+
     if num_samples > 1:
         top1_acc = top1_correct_count / total_mols if total_mols > 0 else 0.0
         top10_acc = top10_correct_count / total_mols if total_mols > 0 else 0.0
-        logger.info(f"  Top-1 MolAcc: {top1_acc:.4f} ({top1_correct_count}/{total_mols})")
-        logger.info(f"  Top-10 MolAcc: {top10_acc:.4f} ({top10_correct_count}/{total_mols})")
+        if log_enabled:
+            logger.info(f"  Top-1 MolAcc: {top1_acc:.4f} ({top1_correct_count}/{total_mols})")
+            logger.info(f"  Top-10 MolAcc: {top10_acc:.4f} ({top10_correct_count}/{total_mols})")
 
     result_dict = {
         'recon_success_rate': 1.0,
@@ -643,7 +701,7 @@ def evaluate_reconstruction(model, val_dataset, device, config, mode, atomic_num
         'mol_accuracy': mol_acc
     }
 
-    # 添加 Top-K 指标
+
     if num_samples > 1:
         result_dict['top1_mol_accuracy'] = top1_correct_count / total_mols if total_mols > 0 else 0.0
         result_dict['top10_mol_accuracy'] = top10_correct_count / total_mols if total_mols > 0 else 0.0
@@ -652,92 +710,117 @@ def evaluate_reconstruction(model, val_dataset, device, config, mode, atomic_num
 
 
 def check_prediction_distribution(edge_logits, edge_types, logger, iteration):
-    """
-    检查预测分布，诊断模型是否陷入局部最优
-
-    Args:
-        edge_logits: 模型预测的logits
-        edge_types: 真实边类型
-        logger: 日志器
-        iteration: 当前迭代次数
-    """
+    """check_prediction_distribution implementation."""
     with torch.no_grad():
         pred = torch.argmax(edge_logits, dim=-1)
         pred_dist = torch.bincount(pred, minlength=5)
         true_dist = torch.bincount(edge_types, minlength=5)
 
-        # 计算各类别的准确率
+
         total_acc = (pred == edge_types).float().mean().item()
 
-        # 有键边的准确率
+
         bond_mask = edge_types > 0
         if bond_mask.sum() > 0:
             bond_acc = ((pred == edge_types) & bond_mask).sum().item() / bond_mask.sum().item()
         else:
             bond_acc = 0.0
 
-        # 检查是否全预测为无键
+
         no_bond_ratio = pred_dist[0].item() / pred.shape[0]
 
-        logger.info(f"[分布检查] Iter {iteration}:")
-        logger.info(f"  预测分布: {pred_dist.tolist()} (无键占比: {no_bond_ratio:.2%})")
-        logger.info(f"  真实分布: {true_dist.tolist()}")
-        logger.info(f"  总准确率: {total_acc:.4f}, 有键准确率: {bond_acc:.4f}")
+        logger.info(f"[distributioncheck] Iter {iteration}:")
+        logger.info(f"  predicted distribution: {pred_dist.tolist()} (no-bond ratio: {no_bond_ratio:.2%})")
+        logger.info(f"  true distribution: {true_dist.tolist()}")
+        logger.info(f"  overall accuracy: {total_acc:.4f}, bond accuracy: {bond_acc:.4f}")
 
         if no_bond_ratio > 0.99:
-            logger.warning(f"  ⚠️ 警告: 模型预测几乎全是无键({no_bond_ratio:.2%})，可能陷入局部最优!")
+            logger.warning(f"The model predicts almost exclusively no-bond classes ({no_bond_ratio:.2%})")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/train.yml', help='配置文件路径')
-    parser.add_argument('--device', type=str, default='cuda', help='训练设备')
-    parser.add_argument('--logdir', type=str, default='/root/tf-logs/', help='日志目录')
-    parser.add_argument('--ckptdir', type=str, default='./checkpoints/', help='checkpoint保存目录')
-    parser.add_argument('--resume', type=str, default=None, help='恢复训练的checkpoint路径')
-    parser.add_argument('--auto_resume', action='store_true', help='自动加载当前模式下最新的checkpoint继续训练')
+    parser.add_argument('--config', type=str, default='configs/train_ms2mol.yml', help='Configuration-file path')
+    parser.add_argument('--device', type=str, default='auto', help='Training device: auto/cpu/cuda/cuda:0')
+    parser.add_argument('--logdir', type=str, default='./checkpoints/logs', help='Log directory')
+    parser.add_argument('--ckptdir', type=str, default='./checkpoints/', help='Checkpoint output directory')
+    parser.add_argument('--resume', type=str, default=None, help='Checkpoint path for resuming training')
+    parser.add_argument('--auto_resume', action='store_true', help='Resume from the latest checkpoint for the current mode')
     parser.add_argument('--pretrained_ckpt', type=str, default=None,
-                        help='上一阶段 ckpt 路径（仅模型权重，strict=False，从 0 步开始）。'
-                             '用法：graph2mol 时传 align ckpt；ms2mol 时传 graph2mol ckpt')
+                        help='Previous-stage checkpoint (model weights only, strict=False). '
+                             'Use an alignment checkpoint for Graph2Mol or a Graph2Mol checkpoint for MS2Mol.')
     parser.add_argument('--align_ckpt', type=str, default=None,
-                        help='align 阶段产出的 ckpt（含 ms_encoder + graph_encoder）。'
-                             '仅 ms2mol 阶段用：从中提取 ms_encoder.* 权重叠加到当前模型')
-    parser.add_argument('--overfit_test', default=False, help='运行单batch过拟合测试')
+                        help='Alignment checkpoint containing ms_encoder and graph_encoder weights; '
+                             'used only to initialize the MS2Mol spectrum encoder')
+    parser.add_argument('--overfit_test', default=False, help='Run a single-batch overfitting test')
+    parser.add_argument('--max_train_samples', type=int, default=None,
+                        help='Maximum number of training samples for a small validation run')
+    parser.add_argument('--max_val_samples', type=int, default=None,
+                        help='Maximum number of validation samples for a small validation run')
+    parser.add_argument('--max_iters', type=int, default=None,
+                        help='Override config.train.max_iters')
+    parser.add_argument('--val_freq', type=int, default=None,
+                        help='override config.train.val_freq')
+    parser.add_argument('--save_freq', type=int, default=None,
+                        help='override config.train.save_freq')
+    parser.add_argument('--optimizer_lr', type=float, default=None,
+                        help='Override config.train.optimizer.lr')
     args = parser.parse_args()
+    distributed, rank, local_rank, world_size = setup_distributed(args)
+    is_main = is_main_process(rank)
 
     config = load_config(args.config)
-    seed_all(config.train.seed)
+    if args.max_iters is not None:
+        config.train.max_iters = args.max_iters
+    if args.val_freq is not None:
+        config.train.val_freq = args.val_freq
+    if args.save_freq is not None:
+        config.train.save_freq = args.save_freq
+    if args.optimizer_lr is not None:
+        config.train.optimizer.lr = args.optimizer_lr
+    seed_all(int(config.train.seed) + rank)
+
+    if not distributed:
+        if args.device == 'auto':
+            args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        elif args.device.startswith('cuda') and not torch.cuda.is_available():
+            print(f"[WARNING] --device {args.device}  but  CUDA is unavailable, switching to  cpu")
+            args.device = 'cpu'
 
     mode = 'flash-model'
 
-    # ★ 三阶段切换：align / graph2mol / ms2mol
-    stage = getattr(config.model, 'stage', None)
-    if stage not in ('align', 'graph2mol', 'ms2mol'):
-        raise ValueError(
-            f"model.stage 必须是 align / graph2mol / ms2mol 之一，得到 {stage!r}"
-        )
 
-    # 按 stage 自动覆盖 dataset 块（无需手改 yaml）：
-    #   align     → DiffMSMSGDataset (DeniMS 格式：sub-formula 序列 + dense X/E)
-    #   graph2mol → SmilesDataset (smiles，HMDB+DSSTox+COCONUT+MOSES 3.3M，仅 mol)
-    #   ms2mol    → DiffMSMSGDataset (同 align，但 BFN 主干用条件)
+    stage = getattr(config.model, 'stage', None)
+    if stage not in ('graph2mol', 'ms2mol', 'joint'):
+        raise ValueError(f"model.stage must be one of  graph2mol/ms2mol/joint, ; received  {stage!r}")
+
+
+
+
+
+
     if stage == 'graph2mol':
-        # graph2mol 用 SmilesDataset：HMDB+DSSTox+COCONUT+MOSES+MSG（按 csv split 列切 train/val/test）
-        # MSG 部分的 split 与 ms2mol 阶段保持一致 → val/test 永远是 MSG 那批分子
-        pretrain_root = './data/pretrain'
+
+        dataset_cfg = config.dataset
+        pretrain_root = cfg_get(dataset_cfg, 'root', './data/pretrain')
         config.dataset = EasyDict({
             'name': 'smiles',
             'root': pretrain_root,
-            'smiles_file': os.path.join(pretrain_root, 'pretrain_smiles.csv'),
-            'max_atoms': None,
-            'split_seed': 2026,
-            'split_ratio': [0.95, 0.025, 0.025],
-            'data_subset_ratio': 1.0,
+            'smiles_file': cfg_get(
+                dataset_cfg, 'smiles_file',
+                os.path.join(pretrain_root, 'pretrain_smiles.csv'),
+            ),
+            'max_atoms': cfg_get(dataset_cfg, 'max_atoms', None),
+            'split_seed': int(cfg_get(dataset_cfg, 'split_seed', 2026)),
+            'split_ratio': cfg_get(dataset_cfg, 'split_ratio', [0.95, 0.025, 0.025]),
+            'data_subset_ratio': float(cfg_get(dataset_cfg, 'data_subset_ratio', 1.0)),
+            'cache_dir': cfg_get(dataset_cfg, 'cache_dir', './data/cache'),
             'atomic_numbers': list(config.chem.atomic_numbers)
                 if isinstance(config.chem.atomic_numbers, (list, tuple))
                 else [5, 6, 7, 8, 9, 14, 15, 16, 17, 33, 34, 35, 53],
         })
-    else:  # align / ms2mol：均用 DiffMS 预处理过的 MSG（含 sub-formula 标注）
+    else:
+
         config.dataset = EasyDict({
             'name': 'msg_diffms',
             'root': config.dataset.get('root', './data/msg_diffms'),
@@ -745,55 +828,86 @@ def main():
             'instrument_type': config.dataset.get('instrument_type', 'all'),
             'data_subset_ratio': 1.0,
             'max_peaks': config.dataset.get('max_peaks', 128),
+            'cache_dir': config.dataset.get('cache_dir', './data/cache'),
+
+
+            'graph2mol': config.dataset.get('graph2mol', None),
+            'graph2mol_root': config.dataset.get(
+                'graph2mol_root',
+                config.dataset.get('pretrain_root', './data/pretrain'),
+            ),
+            'graph2mol_smiles_file': config.dataset.get(
+                'graph2mol_smiles_file',
+                config.dataset.get('pretrain_smiles_file', None),
+            ),
+            'pretrain_root': config.dataset.get('pretrain_root', './data/pretrain'),
+            'pretrain_smiles_file': config.dataset.get('pretrain_smiles_file', None),
         })
 
-    mode_with_spectrum = stage  # 用 stage 名命名子目录：align / graph2mol / ms2mol
+    mode_with_spectrum = stage
 
     log_dir = os.path.join(args.logdir, mode_with_spectrum)
-    os.makedirs(log_dir, exist_ok=True)
-    logger = get_logger('train', log_dir)
-    writer = SummaryWriter(log_dir)
-
     ckpt_dir = os.path.join(args.ckptdir, mode_with_spectrum)
-    os.makedirs(ckpt_dir, exist_ok=True)
+    if is_main:
+        os.makedirs(log_dir, exist_ok=True)
+        os.makedirs(ckpt_dir, exist_ok=True)
+    ddp_barrier(distributed)
+
+    if is_main:
+        logger = get_logger('train', log_dir)
+        writer = SummaryWriter(log_dir)
+    else:
+        logger = get_logger(f'train.rank{rank}', None)
+        logger.setLevel(logging.WARNING)
+        writer = NullWriter()
 
     logger.info(args)
     logger.info(config)
-    logger.info(f'训练模式: {mode}')
-    logger.info(f'阶段: {stage}')
-    logger.info(f'保存目录: {mode_with_spectrum}')
+    logger.info(f'Training mode: {mode}')
+    logger.info(f'stage: {stage}')
+    if distributed:
+        logger.info(f'DDP: world_size={world_size}, rank={rank}, local_rank={local_rank}, device={args.device}')
+    logger.info(f'Output directory: {mode_with_spectrum}')
 
-    # 加载数据集
-    logger.info('加载数据集...')
-    dataset, subsets = get_dataset(config.dataset)
 
-    # 处理原子类型配置：支持 'auto' 自动检测
+    logger.info('Loading dataset...')
+    if distributed and stage == 'graph2mol' and not is_main:
+        processed_path, keys_path = expected_smiles_processed_paths(
+            config.dataset, config.chem.atomic_numbers
+        )
+        logger.warning(f'[graph2mol] rank {rank} is waiting for rank 0 to complete LMDB preprocessing')
+        wait_for_files([processed_path, keys_path], logger, f'[graph2mol] rank{rank} LMDB wait')
+        dataset, subsets = get_dataset(config.dataset)
+    else:
+        dataset, subsets = get_dataset(config.dataset)
+
+
     atomic_numbers_config = config.chem.atomic_numbers
     if atomic_numbers_config == 'auto':
-        # 从数据集中获取自动检测的原子类型
+
         if hasattr(dataset, 'detected_atomic_numbers') and dataset.detected_atomic_numbers:
             atomic_numbers = dataset.detected_atomic_numbers
-            logger.info(f'自动检测到的原子类型: {atomic_numbers}')
+            logger.info(f'Automatically detected atom types: {atomic_numbers}')
         else:
-            # 默认原子类型
+
             atomic_numbers = [5, 6, 7, 8, 9, 14, 15, 16, 17, 33, 34, 35, 53]
-            logger.info(f'使用默认原子类型: {atomic_numbers}')
+            logger.info(f'Using default atom types: {atomic_numbers}')
     else:
         atomic_numbers = list(atomic_numbers_config)
-        logger.info(f'使用配置文件指定的原子类型: {atomic_numbers}')
+        logger.info(f'Using atom types specified by the configuration: {atomic_numbers}')
 
-    # 更新配置中的原子类型（用于后续保存）
+
     config.chem.atomic_numbers = atomic_numbers
 
-    # 根据数据集类型选择合适的 featurizer
+
     dataset_name = config.dataset.get('name', 'msg')
     if dataset_name == 'msg_diffms':
-        # DiffMSMSGDataset 自己输出已编码的 PyG Data，不需要 FeaturizeMol2D
-        logger.info('msg_diffms 自带编码，跳过 transform')
+
+        logger.info('msg_diffms contains encoded features; skipping graph transformation')
         featurizer = None
     elif dataset_name in ('msfile', 'smiles'):
-        # MSFileDataset / SmilesDataset 使用简化的 2D featurizer
-        logger.info('使用 FeaturizeMol2D（简化 2D 格式）')
+
+        logger.info('Using FeaturizeMol2D')
         featurizer = FeaturizeMol2D(
             atomic_numbers=atomic_numbers,
             mol_bond_types=config.chem.mol_bond_types,
@@ -801,8 +915,8 @@ def main():
             use_mask_edge=config.transform.get('use_mask_edge', False)
         )
     else:
-        # 其他数据集使用原始 featurizer
-        logger.info('使用 FeaturizeMol（原始格式）')
+
+        logger.info('Using FeaturizeMol')
         featurizer = FeaturizeMol(
             atomic_numbers=atomic_numbers,
             mol_bond_types=config.chem.mol_bond_types,
@@ -812,149 +926,288 @@ def main():
     if featurizer is not None:
         transform = Compose([featurizer])
         dataset.transform = transform
-    # else: msg_diffms 用自身输出，不应用 transform
+
+
+
+
+
+
 
     train_dataset = subsets['train']
-    # eval_split: 'val'（默认）或 'test'，控制训练时评估用的子集
-    eval_split = config.train.get('eval_split', 'val')
-    if eval_split not in ('val', 'test'):
-        raise ValueError(f"train.eval_split 只能是 'val' 或 'test'，得到 {eval_split!r}")
-    val_dataset = subsets[eval_split]
 
-    # 按 stage 选 collate：
-    #   align     → collate_msg_diffms（不需要 cache，实时跑双塔）
-    #   graph2mol → make_smiles_collate_with_cache(zmol_cache)
-    #   ms2mol    → make_msg_diffms_collate_with_cache(zms_cache)
-    if stage == 'align':
-        from utils.transforms import collate_msg_diffms
-        collate_fn = collate_msg_diffms
-    elif stage == 'graph2mol':
-        # 构建 zmol cache：用 align ckpt 给所有 SmilesDataset 里的 unique SMILES 算 graph_emb
+
+    eval_split = config.train.get('eval_split', 'val')
+    if eval_split == 'valid':
+        logger.warning("Interpreting train.eval_split='valid' as 'val'; update the configuration to 'val'")
+        eval_split = 'val'
+    if eval_split not in ('val', 'test'):
+        raise ValueError(f"train.eval_split must be 'val' or 'test'; received {eval_split!r}")
+    val_dataset = subsets[eval_split]
+    train_dataset = limit_dataset(train_dataset, args.max_train_samples, config.train.seed)
+    val_dataset = limit_dataset(val_dataset, args.max_val_samples, config.train.seed + 1)
+
+
+    #   graph2mol  ->  make_smiles_collate_with_cache(zmol_cache)
+    #   ms2mol     ->  make_msg_diffms_collate_with_cache(zms_cache)
+
+    if stage == 'graph2mol':
         from utils.dataset import ensure_cond_emb_cache, _cache_paths
         from utils.transforms import make_smiles_collate_with_cache
-        align_ckpt_path = (args.align_ckpt or
-                           getattr(config.model, 'align_ckpt_path', None) or
-                           './checkpoints/Encoder_Contrastive_FragHub.pth')
-        if not os.path.exists(align_ckpt_path):
-            raise FileNotFoundError(f"graph2mol 阶段必须有 align ckpt 来构建 zmol cache: {align_ckpt_path}")
+
+        align_ckpt_for_cache = (args.align_ckpt or './checkpoints/align/align.pt')
+        if not os.path.exists(align_ckpt_for_cache):
+            raise FileNotFoundError(
+                f"graph2mol stage requires  align ckpt  to build  zmol cache.\n"
+                f"expected path: {align_ckpt_for_cache}\n"
+                f"finish training  align stage, the  best ckpt switching to nameas  align.pt place under  ./checkpoints/align/"
+            )
+        logger.info(f'[graph2mol] Building or loading with the alignment checkpoint:  zmol cache: {align_ckpt_for_cache}')
 
         cache_dir = getattr(config.dataset, 'cache_dir', './data/cache')
         zmol_cache_path = _cache_paths(cache_dir)['zmol']
+        zmol_ready_path = zmol_cache_path + '.ready'
 
-        if os.path.exists(zmol_cache_path):
-            # cache 已存在 → 直接读，跳过扫 LMDB 和 RDKit 解析（省 10+ 分钟 + 几小时）
-            logger.info(f'[graph2mol] zmol cache 已存在 → 直接加载（跳过扫 LMDB）: {zmol_cache_path}')
+        if is_main and os.path.exists(zmol_cache_path) and os.path.getsize(zmol_cache_path) == 0:
+            logger.warning(f'[graph2mol] found  0 bytes zmol cache, delete and rebuild: {zmol_cache_path}')
+            os.remove(zmol_cache_path)
+            if os.path.exists(zmol_ready_path):
+                os.remove(zmol_ready_path)
+
+        if distributed and (not is_main) and (not os.path.exists(zmol_ready_path)):
+            logger.warning(f'[graph2mol] rank{rank} waiting for  rank0 building zmol cache: {zmol_cache_path}')
+            wait_for_files([zmol_ready_path], logger, f'[graph2mol] rank{rank} zmol cache wait')
             try:
                 zmol_cache = torch.load(zmol_cache_path, weights_only=False)
             except TypeError:
                 zmol_cache = torch.load(zmol_cache_path)
-            logger.info(f'[graph2mol] 已加载 zmol cache: {len(zmol_cache)} 条')
+            logger.warning(f'[graph2mol] rank{rank} loaded zmol cache: {len(zmol_cache)}  entries')
+        elif os.path.exists(zmol_cache_path):
+            logger.info(f'[graph2mol] zmol cache already exists  ->  load directly: {zmol_cache_path}')
+            try:
+                zmol_cache = torch.load(zmol_cache_path, weights_only=False)
+            except TypeError:
+                zmol_cache = torch.load(zmol_cache_path)
+            logger.info(f'[graph2mol] loaded zmol cache: {len(zmol_cache)}  entries')
+            if is_main and not os.path.exists(zmol_ready_path):
+                with open(zmol_ready_path, 'w') as fp:
+                    fp.write(str(time.time()))
         else:
-            # cache 不存在 → 扫 LMDB + RDKit + GPU forward
             from tqdm import tqdm as _tqdm
             import pickle as _pk
-            logger.info('[graph2mol] zmol cache 不存在，扫 LMDB 收集所有 unique SMILES ...')
-            all_smiles = set()
-            total_idx = sum(len(sub.indices) if hasattr(sub, 'indices') else len(sub)
-                            for sub in subsets.values())
-            pbar = _tqdm(total=total_idx, desc='扫 LMDB 提取 SMILES', unit='mol',
-                          mininterval=2.0)
-            for split_name, sub in subsets.items():
-                base_ds = sub.dataset if hasattr(sub, 'dataset') else sub
-                indices = sub.indices if hasattr(sub, 'indices') else range(len(base_ds))
-                if hasattr(base_ds, 'keys') and hasattr(base_ds, '_connect_db'):
-                    if base_ds.db is None:
-                        base_ds._connect_db()
-                    # 复用一个 transaction，避免每条 .begin()
-                    with base_ds.db.begin() as txn:
+
+
+
+            smiles_file = getattr(config.dataset, 'smiles_file', None)
+            if smiles_file and os.path.exists(smiles_file):
+                logger.info(f'[graph2mol] Zmol cache is unavailable; reading SMILES from {smiles_file}')
+                import pandas as _pd
+                df = _pd.read_csv(smiles_file)
+                all_smiles = sorted(df['smiles'].dropna().unique().tolist())
+                logger.info(f'[graph2mol] Building the Zmol cache from {len(all_smiles)} unique SMILES')
+            else:
+                logger.info('[graph2mol] Zmol cache and CSV are unavailable; scanning LMDB')
+                all_smiles = set()
+                total_idx = sum(len(sub.indices) if hasattr(sub, 'indices') else len(sub)
+                                for sub in subsets.values())
+                pbar = _tqdm(total=total_idx, desc='Extracting SMILES from LMDB', unit='mol', mininterval=2.0)
+                for split_name, sub in subsets.items():
+                    base_ds = sub.dataset if hasattr(sub, 'dataset') else sub
+                    indices = sub.indices if hasattr(sub, 'indices') else range(len(base_ds))
+                    if hasattr(base_ds, 'keys') and hasattr(base_ds, '_connect_db'):
+                        if base_ds.db is None:
+                            base_ds._connect_db()
+                        with base_ds.db.begin() as txn:
+                            for idx in indices:
+                                raw = txn.get(base_ds.keys[idx])
+                                pbar.update(1)
+                                if raw is None:
+                                    continue
+                                d = _pk.loads(raw)
+                                smi = getattr(d, 'smiles', None)
+                                if smi:
+                                    all_smiles.add(smi)
+                    else:
                         for idx in indices:
-                            raw = txn.get(base_ds.keys[idx])
+                            d = base_ds[idx]
                             pbar.update(1)
-                            if raw is None:
-                                continue
-                            d = _pk.loads(raw)
                             smi = getattr(d, 'smiles', None)
                             if smi:
                                 all_smiles.add(smi)
-                else:
-                    # fallback：通过 __getitem__ 取（慢）
-                    for idx in indices:
-                        d = base_ds[idx]
-                        pbar.update(1)
-                        smi = getattr(d, 'smiles', None)
-                        if smi:
-                            all_smiles.add(smi)
-            pbar.close()
-            all_smiles = sorted(all_smiles)
-            logger.info(f'[graph2mol] {len(all_smiles)} unique SMILES → 构建 zmol cache')
+                pbar.close()
+                all_smiles = sorted(all_smiles)
+                logger.info(f'[graph2mol] {len(all_smiles)} unique SMILES  ->  building zmol cache')
             zmol_cache = ensure_cond_emb_cache(
                 stage='graph2mol',
-                align_ckpt_path=align_ckpt_path,
+                align_ckpt_path=align_ckpt_for_cache,
                 smiles_pool=all_smiles,
                 cache_dir=cache_dir,
                 device=args.device,
                 batch_size=64,
             )
+            if is_main:
+                with open(zmol_ready_path, 'w') as fp:
+                    fp.write(str(time.time()))
         collate_fn = make_smiles_collate_with_cache(zmol_cache)
+
     elif stage == 'ms2mol':
-        from utils.dataset import ensure_cond_emb_cache
-        from utils.transforms import make_msg_diffms_collate_with_cache
-        align_ckpt_path = (args.align_ckpt or
-                           getattr(config.model, 'align_ckpt_path', None) or
-                           './checkpoints/Encoder_Contrastive_FragHub.pth')
-        if not os.path.exists(align_ckpt_path):
-            raise FileNotFoundError(f"ms2mol 阶段必须有 align ckpt 来构建 zms cache: {align_ckpt_path}")
+
+        from utils.dataset import ensure_cond_emb_cache, _cache_paths
+        from utils.transforms import make_msg_diffms_collate_with_cache, make_smiles_collate_with_cache
+        align_ckpt_for_cache = (args.align_ckpt or './checkpoints/align/align.pt')
+        if not os.path.exists(align_ckpt_for_cache):
+            raise FileNotFoundError(
+                f"ms2mol stage requires  align ckpt  to build  zms cache.\n"
+                f"expected path: {align_ckpt_for_cache}"
+            )
         msg_root = config.dataset.get('root', './data/msg_diffms')
+        cache_dir = getattr(config.dataset, 'cache_dir', './data/cache')
+        logger.info(f'[ms2mol] Building or loading with the alignment checkpoint:  zms cache: {align_ckpt_for_cache}')
         zms_cache = ensure_cond_emb_cache(
             stage='ms2mol',
-            align_ckpt_path=align_ckpt_path,
+            align_ckpt_path=align_ckpt_for_cache,
             msg_root=msg_root,
-            cache_dir=getattr(config.dataset, 'cache_dir', './data/cache'),
+            cache_dir=cache_dir,
             device=args.device,
             batch_size=64,
         )
-        collate_fn = make_msg_diffms_collate_with_cache(zms_cache)
+        logger.info(f'[ms2mol] loaded zms cache: {len(zms_cache)}  entries')
+
+
+        _need_zmol = False
+        _ms_cfg = getattr(config.train, 'ms2mol', None) or {}
+        _ms = _ms_cfg.get if isinstance(_ms_cfg, dict) else (lambda k, d=None: getattr(_ms_cfg, k, d))
+        for sub in ('adapter', 'distill'):
+            sub_cfg = _ms(sub, {}) or {}
+            _sub = sub_cfg.get if isinstance(sub_cfg, dict) else (lambda k, d=None: getattr(sub_cfg, k, d))
+            if bool(_sub('enabled', False)):
+                _need_zmol = True
+        zmol_target_cache = None
+        if _need_zmol:
+            zmol_cache_path = _cache_paths(cache_dir)['zmol']
+            if not os.path.exists(zmol_cache_path):
+                raise FileNotFoundError(
+                    f"adapter/KD enabled but  zmol cache  does not exist: {zmol_cache_path}\n"
+                    f"run  graph2mol one timesbuildingcomplete zmol cache"
+                )
+
+
+            try:
+                zmol_target_cache = torch.load(zmol_cache_path, weights_only=False)
+            except TypeError:
+                zmol_target_cache = torch.load(zmol_cache_path)
+            logger.info(f'[ms2mol] adapter/KD enabled  ->  loading zmol cache (canonical SMILES key): '
+                        f'{len(zmol_target_cache)}  entries ({zmol_cache_path})')
+        collate_fn = make_msg_diffms_collate_with_cache(zms_cache, zmol_target_cache=zmol_target_cache)
+
+    elif stage == 'joint':
+
+
+        from utils.dataset import ensure_cond_emb_cache, _cache_paths
+        from utils.transforms import make_msg_diffms_collate_with_cache
+        align_ckpt_for_cache = (args.align_ckpt or './checkpoints/align/align.pt')
+        if not os.path.exists(align_ckpt_for_cache):
+            raise FileNotFoundError(
+                f"joint stage requires  align ckpt  to build  zmol/zms cache.\n"
+                f"expected path: {align_ckpt_for_cache}"
+            )
+        msg_root = config.dataset.get('root', './data/msg_diffms')
+        cache_dir = getattr(config.dataset, 'cache_dir', './data/cache')
+        logger.info(f'[joint] Building or loading with the alignment checkpoint:  zms cache: {align_ckpt_for_cache}')
+        zms_cache = ensure_cond_emb_cache(
+            stage='ms2mol',
+            align_ckpt_path=align_ckpt_for_cache,
+            msg_root=msg_root,
+            cache_dir=cache_dir,
+            device=args.device,
+            batch_size=64,
+        )
+        logger.info(f'[joint] loaded zms cache: {len(zms_cache)}  entries')
+
+
+
+        zmol_target_cache_path = _cache_paths(cache_dir)['zmol']
+        if not os.path.exists(zmol_target_cache_path):
+            raise FileNotFoundError(
+                f"joint stage requires  zmol cache as  MS batch  trainingtarget: {zmol_target_cache_path}\n"
+                f"run  graph2mol stagebuildingthe  cache"
+            )
+        try:
+            zmol_target_cache = torch.load(zmol_target_cache_path, weights_only=False)
+        except TypeError:
+            zmol_target_cache = torch.load(zmol_target_cache_path)
+        logger.info(f'[joint] loaded zmol target cache: {len(zmol_target_cache)}  entries '
+                    f'({zmol_target_cache_path})')
+        collate_fn = make_msg_diffms_collate_with_cache(
+            zms_cache, zmol_target_cache=zmol_target_cache
+        )
+
     else:
         from utils.transforms import collate_with_spectrum_features
         collate_fn = collate_with_spectrum_features
 
+    train_sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        seed=int(config.train.seed),
+        drop_last=False,
+    ) if distributed else None
+
+
+    main_batch_size = int(config.train.batch_size)
+    if stage == 'joint':
+        joint_cfg_for_ms = cfg_get(config.train, 'joint', {}) or {}
+        main_batch_size = int(cfg_get(
+            joint_cfg_for_ms, 'batch_size_ms2', config.train.batch_size
+        ))
+    if main_batch_size <= 0:
+        raise ValueError(f'maindata loader   batch_size must be positive, ; received  {main_batch_size}')
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.train.batch_size,
-        shuffle=True,
+        batch_size=main_batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=config.train.num_workers,
         pin_memory=config.train.pin_memory,
         collate_fn=collate_fn
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config.train.batch_size,
+        batch_size=main_batch_size,
         shuffle=False,
         num_workers=config.train.num_workers,
         pin_memory=config.train.pin_memory,
         collate_fn=collate_fn
     )
 
-    logger.info(f'训练集: {len(train_dataset)}, 评估集({eval_split}): {len(val_dataset)}')
+    logger.info(f'trainingset: {len(train_dataset)}, evaluation set({eval_split}): {len(val_dataset)}, '
+                f'main loader batch_size={main_batch_size}')
 
-    # 验证集子集配置（用于加速训练阶段的验证）
+
     val_subset_ratio = config.train.get('val_subset_ratio', 1.0)
     if val_subset_ratio < 1.0:
         val_subset_size = int(len(val_dataset) * val_subset_ratio)
-        val_subset_indices = torch.randperm(len(val_dataset))[:val_subset_size].tolist()
+        val_subset_generator = torch.Generator()
+        val_subset_seed = int(config.train.get('val_subset_seed', config.train.seed))
+        val_subset_generator.manual_seed(val_subset_seed)
+        val_subset_indices = torch.randperm(
+            len(val_dataset), generator=val_subset_generator
+        )[:val_subset_size].tolist()
         val_subset = torch.utils.data.Subset(val_dataset, val_subset_indices)
-        logger.info(f'验证集子集: {val_subset_size} ({val_subset_ratio*100:.1f}%)')
+        logger.info(f'Validation subset: {val_subset_size} ({val_subset_ratio*100:.1f}%), seed={val_subset_seed}')
     else:
         val_subset = val_dataset
-        logger.info('验证集子集: 使用全部验证集')
+        logger.info('Validation subset: using the full validation set')
 
-    # 提前计算num_edge_types（用于边缘分布计算）
+
     num_edge_types = len(config.chem.mol_bond_types) + 1
 
-    # 创建模型
-    logger.info('创建模型...')
+
+    logger.info('Creating model...')
     num_node_types = len(atomic_numbers) + 1
-    # num_edge_types已在前面定义
+
 
     model_result = create_model(config, num_node_types, num_edge_types, atomic_numbers)
     if isinstance(model_result, tuple):
@@ -964,29 +1217,227 @@ def main():
 
     model = model.to(args.device)
 
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f'模型参数量: {num_params/1e6:.2f}M')
+    # ============================================================
 
-    # 优化器
+    # ============================================================
+    use_adapter = False
+    adapter_mse_w = 0.0
+    use_kd = False
+    teacher_model = None
+    kd_weight = 0.0
+    kd_temperature = 1.0
+    teacher_condition_mode = 'default'
+    if stage in ('ms2mol', 'joint'):
+        ms2mol_cfg = getattr(config.train, 'ms2mol', None) or {}
+        _ms = ms2mol_cfg.get if isinstance(ms2mol_cfg, dict) else (lambda k, d=None: getattr(ms2mol_cfg, k, d))
+        adapter_cfg = _ms('adapter', {}) or {}
+        _ad = adapter_cfg.get if isinstance(adapter_cfg, dict) else (lambda k, d=None: getattr(adapter_cfg, k, d))
+        if bool(_ad('enabled', False)):
+            use_adapter = True
+            adapter_mse_w = float(_ad('mse_weight', 0.5))
+            model.use_zms_adapter = True
+            n_adapter = sum(p.numel() for p in model.zms_adapter.parameters())
+            logger.info(f' [ms2mol/joint] Zms -> Zmol Adapter enabled')
+            logger.info(f'  adapter parameter count: {n_adapter/1e6:.3f}M, MSE loss weights: {adapter_mse_w}')
+
+        distill_cfg = _ms('distill', {}) or {}
+        _dk = distill_cfg.get if isinstance(distill_cfg, dict) else (lambda k, d=None: getattr(distill_cfg, k, d))
+        if bool(_dk('enabled', False)):
+            use_kd = True
+            kd_weight = float(_dk('weight', 1.0))
+            kd_temperature = float(_dk('temperature', 2.0))
+            teacher_condition_mode = str(
+                cfg_get(config.train, 'teacher_condition_mode', 'default')
+            ).lower()
+            if teacher_condition_mode not in ('real', 'default'):
+                raise ValueError(
+                    'train.teacher_condition_mode must be real or default; '
+                    f'received {teacher_condition_mode!r}'
+                )
+            kd_feature_weight = float(_dk('feature_weight', 0.0))
+            kd_feature_layers = _dk('feature_layers', 'all')
+            teacher_ckpt = _dk('teacher_ckpt', '') or ''
+
+            if not teacher_ckpt:
+                import glob, re
+                g2m_dir = os.path.join(args.ckptdir, 'graph2mol')
+                if os.path.isdir(g2m_dir):
+                    cands = [(int(re.search(r'iter(\d+)\.pt$', f).group(1)), f)
+                             for f in glob.glob(os.path.join(g2m_dir, 'graph2mol_iter*.pt'))
+                             if re.search(r'iter(\d+)\.pt$', f)]
+                    if cands:
+                        cands.sort(reverse=True)
+                        teacher_ckpt = cands[0][1]
+            if not teacher_ckpt or not os.path.exists(teacher_ckpt):
+                raise FileNotFoundError(f"KD enabled but cannot find teacher ckpt: {teacher_ckpt}")
+            logger.info(f' [ms2mol/joint] Knowledge Distillation enabled')
+            logger.info(f'  teacher_ckpt: {teacher_ckpt}, logits weight: {kd_weight}, T: {kd_temperature}')
+            logger.info(f'  teacher_condition_mode: {teacher_condition_mode}')
+            if kd_feature_weight > 0:
+                logger.info(f'   Multi-layer feature distillation enabled (FitNet-style): feature_weight={kd_feature_weight}, '
+                            f'layers={kd_feature_layers}')
+                model.capture_layer_h_nodes = True
+            else:
+                model.capture_layer_h_nodes = False
+
+            from models.model import FLASH as _FLASH
+            import copy
+            teacher_cfg = copy.deepcopy(config.model)
+            teacher_model = _FLASH(teacher_cfg, num_node_types, num_edge_types, atomic_numbers).to(args.device)
+            try:
+                t_ck = torch.load(teacher_ckpt, map_location=args.device, weights_only=False)
+            except TypeError:
+                t_ck = torch.load(teacher_ckpt, map_location=args.device)
+            t_state = t_ck['model'] if 'model' in t_ck else t_ck
+            teacher_missing, teacher_unexpected = teacher_model.load_state_dict(
+                t_state, strict=False
+            )
+            assert_release_checkpoint_keys(
+                teacher_missing,
+                teacher_unexpected,
+                context='KD teacher',
+                allow_graph_to_ms=True,
+            )
+            teacher_model.eval()
+            for p in teacher_model.parameters():
+                p.requires_grad = False
+
+            teacher_model.use_zms_adapter = False
+
+            teacher_model.capture_layer_h_nodes = (kd_feature_weight > 0)
+            logger.info(f'  teacher modelloadedand frozen')
+        else:
+            kd_feature_weight = 0.0
+            kd_feature_layers = 'all'
+
+
+
+    start_iter = 0
+    resume_path = args.resume
+    resume_checkpoint = None
+
+
+    if args.auto_resume and resume_path is None:
+        import glob as glob_mod
+        ckpt_pattern = os.path.join(ckpt_dir, f'{mode_with_spectrum}_iter*.pt')
+        ckpt_files = glob_mod.glob(ckpt_pattern)
+        if ckpt_files:
+
+            def extract_iter(path):
+                basename = os.path.basename(path)
+
+                try:
+                    return int(basename.split('_iter')[-1].replace('.pt', ''))
+                except ValueError:
+                    return -1
+            ckpt_files.sort(key=extract_iter)
+            resume_path = ckpt_files[-1]
+            logger.info(f'[auto_resume] foundlatestcheckpoint: {resume_path}')
+        else:
+            logger.info(f'[auto_resume] not foundcheckpoint, start training from iteration zero')
+
+    if resume_path:
+        logger.info(f'from checkpointresume: {resume_path}')
+
+        try:
+            resume_checkpoint = torch.load(resume_path, map_location=args.device, weights_only=False)
+        except TypeError:
+
+            resume_checkpoint = torch.load(resume_path, map_location=args.device)
+        missing, unexpected = model.load_state_dict(resume_checkpoint['model'], strict=False)
+        assert_release_checkpoint_keys(
+            missing,
+            unexpected,
+            context=f'resume ({resume_path})',
+            allow_graph_resume=(stage == 'graph2mol'),
+        )
+        if missing or unexpected:
+            logger.info(f'  - missing keys while resuming training: {len(missing)}; unexpected keys: {len(unexpected)}')
+        start_iter = resume_checkpoint.get('iteration', 0) + 1
+    elif args.pretrained_ckpt:
+
+
+        logger.info(f'from previous stage checkpoint loadingmodelweights: {args.pretrained_ckpt}')
+        try:
+            pretrained_ckpt = torch.load(args.pretrained_ckpt, map_location=args.device, weights_only=False)
+        except TypeError:
+            pretrained_ckpt = torch.load(args.pretrained_ckpt, map_location=args.device)
+        pretrained_state = pretrained_ckpt['model'] if 'model' in pretrained_ckpt else pretrained_ckpt
+        missing, unexpected = model.load_state_dict(pretrained_state, strict=False)
+        assert_release_checkpoint_keys(
+            missing,
+            unexpected,
+            context=f'pretrained ({args.pretrained_ckpt})',
+            allow_graph_to_ms=(stage in ('ms2mol', 'joint')),
+        )
+        logger.info(f'  - missing keys (randomly initialized): {len(missing)}  '
+                    + (f' examples: {missing[:3]}' if missing else ''))
+        logger.info(f'  - unexpected keys (ignored): {len(unexpected)}  '
+                    + (f' examples: {unexpected[:3]}' if unexpected else ''))
+        if unexpected:
+            logger.info('  The non-strict state-dict key set passed the release compatibility allowlist')
+        start_iter = 0
+    else:
+
+        if stage in ('ms2mol', 'joint'):
+            import glob, re
+            g2m_dir = os.path.join(args.ckptdir, 'graph2mol')
+            candidates = []
+            if os.path.isdir(g2m_dir):
+                for f in glob.glob(os.path.join(g2m_dir, 'graph2mol_iter*.pt')):
+                    m = re.search(r'iter(\d+)\.pt$', f)
+                    if m:
+                        candidates.append((int(m.group(1)), f))
+            if candidates:
+                candidates.sort(reverse=True)
+                latest_iter, latest_path = candidates[0]
+                logger.info(f' {stage} stageautomaticallyloadinglatest graph2mol ckpt: {latest_path} (iter={latest_iter})')
+                try:
+                    pre_ckpt = torch.load(latest_path, map_location=args.device, weights_only=False)
+                except TypeError:
+                    pre_ckpt = torch.load(latest_path, map_location=args.device)
+                pre_state = pre_ckpt['model'] if 'model' in pre_ckpt else pre_ckpt
+                miss, unex = model.load_state_dict(pre_state, strict=False)
+                assert_release_checkpoint_keys(
+                    miss,
+                    unex,
+                    context=f'auto graph2mol pretrained ({latest_path})',
+                    allow_graph_to_ms=True,
+                )
+                logger.info(f'  - missing keys: {len(miss)}; unexpected keys: {len(unex)}')
+            else:
+                logger.warning(f'  {stage} not found graph2mol ckpt(path {g2m_dir}), BFN backbonefrom zero initialization')
+        start_iter = 0
+
+
+    model = model.to(args.device)
+
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f'Trainable parameters: {num_params/1e6:.2f}M')
+
+
     optimizer_config = config.train.optimizer
+    _optimizer_params = [p for p in model.parameters() if p.requires_grad]
+    if not _optimizer_params:
+        raise ValueError('No parameters with requires_grad=True were passed to the optimizer')
     if optimizer_config.type == 'adam':
         optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=optimizer_config.lr,
-            weight_decay=optimizer_config.weight_decay,
-            betas=(optimizer_config.beta1, optimizer_config.beta2)
+            _optimizer_params,
+            lr=float(optimizer_config.lr),
+            weight_decay=float(optimizer_config.weight_decay),
+            betas=(float(optimizer_config.beta1), float(optimizer_config.beta2))
         )
     elif optimizer_config.type == 'adamw':
         optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=optimizer_config.lr,
-            weight_decay=optimizer_config.weight_decay,
-            betas=(optimizer_config.beta1, optimizer_config.beta2)
+            _optimizer_params,
+            lr=float(optimizer_config.lr),
+            weight_decay=float(optimizer_config.weight_decay),
+            betas=(float(optimizer_config.beta1), float(optimizer_config.beta2))
         )
     else:
-        raise ValueError(f"未知的优化器类型: {optimizer_config.type}")
+        raise ValueError(f"unknown optimizer type: {optimizer_config.type}")
 
-    # 学习率调度器
+
     scheduler_config = config.train.get('scheduler', None)
     scheduler = None
     if scheduler_config:
@@ -996,120 +1447,148 @@ def main():
                 patience=scheduler_config.patience, min_lr=scheduler_config.min_lr
             )
 
-    # Warmup 调度：前 N 步线性从 0 升到 lr，防止训练初期梯度震荡
+
     warmup_iters = config.train.get('warmup_iters', 1000)
-    base_lr = float(config.train.optimizer.lr)
-    logger.info(f'Warmup: 前 {warmup_iters} 步线性升温至 lr={base_lr}')
+    warmup_target_lrs = [float(pg['lr']) for pg in optimizer.param_groups]
+    for pg, target_lr in zip(optimizer.param_groups, warmup_target_lrs):
+        pg.setdefault('initial_lr', target_lr)
+    target_lr_str = ', '.join(f'{lr:.3e}' for lr in warmup_target_lrs)
+    logger.info(f'Warmup: before  {warmup_iters} stepslinearly warm up to  param_group_lrs=[{target_lr_str}]')
 
-    # 恢复训练
-    start_iter = 0
-    resume_path = args.resume
-
-    # auto_resume：自动查找当前模式下 iter 最大的 checkpoint
-    if args.auto_resume and resume_path is None:
-        import glob as glob_mod
-        ckpt_pattern = os.path.join(ckpt_dir, f'{mode_with_spectrum}_iter*.pt')
-        ckpt_files = glob_mod.glob(ckpt_pattern)
-        if ckpt_files:
-            # 从文件名中提取 iter 数字，找最大的
-            def extract_iter(path):
-                basename = os.path.basename(path)
-                # 格式: flash-model-flash_iter2000.pt
-                try:
-                    return int(basename.split('_iter')[-1].replace('.pt', ''))
-                except ValueError:
-                    return -1
-            ckpt_files.sort(key=extract_iter)
-            resume_path = ckpt_files[-1]
-            logger.info(f'[auto_resume] 找到最新checkpoint: {resume_path}')
-        else:
-            logger.info(f'[auto_resume] 未找到checkpoint，从头开始训练')
-
-    if resume_path:
-        logger.info(f'从checkpoint恢复: {resume_path}')
-        # 兼容不同版本的PyTorch（2.6+需要weights_only=False来加载包含EasyDict的checkpoint）
+    if resume_checkpoint is not None:
         try:
-            checkpoint = torch.load(resume_path, map_location=args.device, weights_only=False)
-        except TypeError:
-            # 旧版本PyTorch不支持weights_only参数
-            checkpoint = torch.load(resume_path, map_location=args.device)
-        model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        if scheduler and 'scheduler' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler'])
-        start_iter = checkpoint.get('iteration', 0) + 1
-    elif args.pretrained_ckpt:
-        # 上一阶段 ckpt（仅 model 权重，从 0 步开始）
-        # 用法：graph2mol → 传 align ckpt；ms2mol → 传 graph2mol ckpt
-        logger.info(f'从上一阶段 checkpoint 加载模型权重: {args.pretrained_ckpt}')
-        try:
-            pretrained_ckpt = torch.load(args.pretrained_ckpt, map_location=args.device, weights_only=False)
-        except TypeError:
-            pretrained_ckpt = torch.load(args.pretrained_ckpt, map_location=args.device)
-        pretrained_state = pretrained_ckpt['model'] if 'model' in pretrained_ckpt else pretrained_ckpt
-        missing, unexpected = model.load_state_dict(pretrained_state, strict=False)
-        logger.info(f'  - 缺失键 (随机初始化): {len(missing)} 个'
-                    + (f' 例: {missing[:3]}' if missing else ''))
-        logger.info(f'  - 多余键 (已忽略): {len(unexpected)} 个'
-                    + (f' 例: {unexpected[:3]}' if unexpected else ''))
-        if unexpected:
-            logger.warning('  存在 unexpected keys，可能维度/结构不匹配，请确认。')
-        start_iter = 0
-    else:
-        # 默认分支：align 阶段如果 yaml 配置了 align_ckpt_path，自动加载 DeniMS ckpt
-        align_ckpt_path = getattr(config.model, 'align_ckpt_path', None)
-        if stage == 'align' and align_ckpt_path and os.path.exists(align_ckpt_path):
-            logger.info(f'★ 从 yaml 配置自动加载 DeniMS align ckpt: {align_ckpt_path}')
+            optimizer.load_state_dict(resume_checkpoint['optimizer'])
+            if scheduler and 'scheduler' in resume_checkpoint:
+                scheduler.load_state_dict(resume_checkpoint['scheduler'])
+        except ValueError as exc:
+            logger.warning(
+                "The optimizer or scheduler state is incompatible with the current parameter groups; "
+                f"restoring model weights only: {exc}"
+            )
+
+
+
+    if distributed:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
+        logger.info('DDP initialized with find_unused_parameters=True')
+
+    # ============================================================
+
+    # ============================================================
+    g2m_loader = None
+    if stage == 'joint':
+        from utils.dataset import get_dataset as _get_dataset
+        from utils.dataset import ensure_cond_emb_cache, _cache_paths
+        from utils.transforms import make_smiles_collate_with_cache
+        from easydict import EasyDict as _ED
+        logger.info('[joint] Building Graph2Mol data loader (SmilesDataset)...')
+        joint_g2m_cfg = cfg_get(config.dataset, 'graph2mol', {}) or {}
+        g2m_root = cfg_get(
+            joint_g2m_cfg, 'root',
+            cfg_get(
+                config.dataset, 'graph2mol_root',
+                cfg_get(config.dataset, 'pretrain_root', './data/pretrain'),
+            ),
+        )
+        g2m_smiles_file = cfg_get(joint_g2m_cfg, 'smiles_file', None)
+        if not g2m_smiles_file:
+            g2m_smiles_file = cfg_get(config.dataset, 'graph2mol_smiles_file', None)
+        if not g2m_smiles_file:
+            g2m_smiles_file = cfg_get(config.dataset, 'pretrain_smiles_file', None)
+        if not g2m_smiles_file:
+            g2m_smiles_file = os.path.join(g2m_root, 'pretrain_smiles.csv')
+        g2m_ds_cfg = _ED({
+            'name': 'smiles',
+            'root': g2m_root,
+            'smiles_file': g2m_smiles_file,
+            'max_atoms': cfg_get(joint_g2m_cfg, 'max_atoms', None),
+            'split_seed': int(cfg_get(joint_g2m_cfg, 'split_seed', 2026)),
+            'split_ratio': cfg_get(joint_g2m_cfg, 'split_ratio', [0.95, 0.025, 0.025]),
+            'data_subset_ratio': float(cfg_get(joint_g2m_cfg, 'data_subset_ratio', 1.0)),
+            'cache_dir': cfg_get(joint_g2m_cfg, 'cache_dir', config.dataset.cache_dir),
+            'atomic_numbers': list(config.chem.atomic_numbers),
+        })
+        g2m_ds, g2m_subsets = _get_dataset(g2m_ds_cfg)
+        from torch_geometric.transforms import Compose as PygCompose
+        g2m_featurizer = FeaturizeMol2D(
+            atomic_numbers=atomic_numbers,
+            mol_bond_types=config.chem.mol_bond_types,
+            use_mask_node=config.transform.get('use_mask_node', True),
+            use_mask_edge=config.transform.get('use_mask_edge', False),
+        )
+        g2m_ds.transform = PygCompose([g2m_featurizer])
+
+        align_for_zmol = args.align_ckpt or './checkpoints/align/align.pt'
+        if not os.path.exists(align_for_zmol):
+            raise FileNotFoundError(
+                f"joint stage requires  align ckpt  to build  zmol cache: {align_for_zmol}"
+            )
+        cache_dir = cfg_get(g2m_ds_cfg, 'cache_dir', './data/cache')
+        zmol_cache_path = _cache_paths(cache_dir)['zmol']
+        if os.path.abspath(zmol_cache_path) == os.path.abspath(zmol_target_cache_path):
+
+
+            zmol_cache = zmol_target_cache
+            logger.info(f'[joint] reusing loaded  zmol target cache: {len(zmol_cache)}  entries '
+                        f'({zmol_cache_path})')
+        elif os.path.exists(zmol_cache_path):
             try:
-                ack = torch.load(align_ckpt_path, map_location=args.device, weights_only=False)
+                zmol_cache = torch.load(zmol_cache_path, weights_only=False)
             except TypeError:
-                ack = torch.load(align_ckpt_path, map_location=args.device)
-            sd = ack['model'] if 'model' in ack else ack
-            missing, unexpected = model.load_state_dict(sd, strict=False)
-            logger.info(f'  - 缺失键 (随机初始化): {len(missing)} 个'
-                        + (f' 例: {missing[:3]}' if missing else ''))
-            logger.info(f'  - 多余键 (已忽略): {len(unexpected)} 个'
-                        + (f' 例: {unexpected[:3]}' if unexpected else ''))
-        elif stage == 'align':
-            logger.info('  align 阶段从随机权重开始（未配置 align_ckpt_path 或文件不存在）')
-        start_iter = 0
-
-    # ms2mol 阶段：从 align ckpt 注入 ms_encoder.* 权重（覆盖 init）
-    if stage == 'ms2mol' and args.align_ckpt:
-        logger.info(f'从 align checkpoint 注入 ms_encoder 权重: {args.align_ckpt}')
-        try:
-            align_ckpt = torch.load(args.align_ckpt, map_location=args.device, weights_only=False)
-        except TypeError:
-            align_ckpt = torch.load(args.align_ckpt, map_location=args.device)
-        align_state = align_ckpt['model'] if 'model' in align_ckpt else align_ckpt
-        # 仅保留 ms_encoder.* 键
-        ms_state = {k: v for k, v in align_state.items() if k.startswith('ms_encoder.')}
-        if not ms_state:
-            logger.warning(f'  align ckpt 中未找到 ms_encoder.* 键，请确认 ckpt 来自 align 阶段')
+                zmol_cache = torch.load(zmol_cache_path)
+            logger.info(f'[joint] loaded zmol cache: {len(zmol_cache)}  entries')
         else:
-            missing2, unexpected2 = model.load_state_dict(ms_state, strict=False)
-            n_loaded = len(ms_state) - sum(1 for k in missing2 if k.startswith('ms_encoder.'))
-            logger.info(f'  - 已注入 ms_encoder 权重: {n_loaded} / {len(ms_state)} 键')
+            logger.info(f'[joint] zmol cache  does not exist  ->  from  smiles datasetbuilding(from  align ckpt: {align_for_zmol})')
+            all_smiles = sorted({d.smiles for d in g2m_ds if hasattr(d, 'smiles') and d.smiles})
+            logger.info(f'[joint] collected  {len(all_smiles)} unique SMILES, startingbuilding zmol cache ...')
+            zmol_cache = ensure_cond_emb_cache(
+                stage='graph2mol',
+                align_ckpt_path=align_for_zmol,
+                smiles_pool=all_smiles,
+                cache_dir=cache_dir,
+                device=args.device,
+                batch_size=64,
+            )
+            logger.info(f'[joint] built zmol cache: {len(zmol_cache)}  entries')
+        g2m_collate = make_smiles_collate_with_cache(zmol_cache)
 
-    # graph2mol 阶段：从 align ckpt 注入 graph_encoder.* 权重（覆盖 init）
-    if stage == 'graph2mol' and args.align_ckpt:
-        logger.info(f'从 align checkpoint 注入 graph_encoder 权重: {args.align_ckpt}')
-        try:
-            align_ckpt = torch.load(args.align_ckpt, map_location=args.device, weights_only=False)
-        except TypeError:
-            align_ckpt = torch.load(args.align_ckpt, map_location=args.device)
-        align_state = align_ckpt['model'] if 'model' in align_ckpt else align_ckpt
-        ge_state = {k: v for k, v in align_state.items() if k.startswith('graph_encoder.')}
-        if not ge_state:
-            logger.warning(f'  align ckpt 中未找到 graph_encoder.* 键')
-        else:
-            missing3, unexpected3 = model.load_state_dict(ge_state, strict=False)
-            n_loaded = len(ge_state) - sum(1 for k in missing3 if k.startswith('graph_encoder.'))
-            logger.info(f'  - 已注入 graph_encoder 权重: {n_loaded} / {len(ge_state)} 键')
+        joint_cfg = getattr(config.train, 'joint', None) or {}
+        joint_get = (joint_cfg.get if isinstance(joint_cfg, dict) else
+                     lambda k, d=None: getattr(joint_cfg, k, d))
+        g2m_bs = int(joint_get('batch_size_g2m', 64))
+        g2m_sampler = DistributedSampler(
+            g2m_subsets['train'],
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=int(config.train.seed) + 1009,
+            drop_last=False,
+        ) if distributed else None
+        g2m_loader = DataLoader(
+            g2m_subsets['train'], batch_size=g2m_bs,
+            shuffle=(g2m_sampler is None), sampler=g2m_sampler,
+            num_workers=config.train.num_workers, pin_memory=config.train.pin_memory,
+            collate_fn=g2m_collate,
+        )
+        logger.info(f'[joint] graph2mol train loader: {len(g2m_subsets["train"])}  entries, batch_size={g2m_bs}')
 
-    # 训练循环
-    logger.info('开始训练...')
+
+    logger.info('Starting training...')
+    train_epoch = 0
+    if train_sampler is not None:
+        train_sampler.set_epoch(train_epoch)
     train_iterator = iter(train_loader)
+
+
+    def _is_oom(e):
+        return isinstance(e, RuntimeError) and 'out of memory' in str(e).lower()
+
+    oom_count = 0
 
     for it in range(start_iter, config.train.max_iters):
         model.train()
@@ -1117,102 +1596,275 @@ def main():
         try:
             batch = next(train_iterator)
         except StopIteration:
+            train_epoch += 1
+            if train_sampler is not None:
+                train_sampler.set_epoch(train_epoch)
             train_iterator = iter(train_loader)
             batch = next(train_iterator)
 
+
+        if batch is None:
+            continue
+
         optimizer.zero_grad()
 
-        # Warmup：前 warmup_iters 步线性升温
+
         if it < warmup_iters:
-            warmup_lr = base_lr * (it + 1) / warmup_iters
-            for pg in optimizer.param_groups:
-                pg['lr'] = warmup_lr
+            warmup_scale = (it + 1) / warmup_iters
+            for pg, target_lr in zip(optimizer.param_groups, warmup_target_lrs):
+                pg['lr'] = target_lr * warmup_scale
 
         if it == start_iter:
             print_first_iter_debug(batch, config, logger)
 
-        # 训练步骤
-        loss_dict = train_flash(model, batch, args.device, config, iteration=it, logger=logger)
+        # ============================================================
 
-        loss = loss_dict['loss']
+        # ============================================================
+        try:
 
-        # NaN/Inf 检测：跳过本步，不更新参数，防止参数污染
-        if torch.isnan(loss) or torch.isinf(loss):
-            logger.warning(f"[Iter {it}] 检测到 NaN/Inf loss，跳过本步更新（可能是数值溢出）")
-            optimizer.zero_grad()
-            continue
+            loss_dict = train_flash(model, batch, args.device, config, iteration=it, logger=logger)
 
-        loss.backward()
+            loss = loss_dict['loss']
 
-        # 记录梯度到TensorBoard
-        # 1. 质谱特征编码器梯度
-        if hasattr(model, 'spectrum_projector') and model.spectrum_projector is not None:
-            spec_grads = [p.grad.norm().item() for n, p in model.spectrum_projector.named_parameters() if p.grad is not None]
+            # ============================================================
+
+
+            # ============================================================
+            if use_adapter and stage in ('ms2mol', 'joint'):
+                if hasattr(batch, 'zmol_target') and batch.zmol_target is not None:
+                    adapter_out = unwrap_model(model)._last_adapter_out
+                    zmol_target = batch.zmol_target.to(adapter_out.device)
+                    mse = F.mse_loss(adapter_out, zmol_target)
+                    loss = loss + adapter_mse_w * mse
+                    loss_dict['loss_adapter_mse'] = mse.detach()
+                    if it < 10:
+                        logger.info(f"[Iter {it}] adapter MSE: {mse.item():.4f}, "
+                                    f"weight={adapter_mse_w}")
+
+            # ============================================================
+
+
+            # ============================================================
+            if use_kd and teacher_model is not None and stage in ('ms2mol', 'joint'):
+                if hasattr(batch, 'zmol_target') and batch.zmol_target is not None:
+                    with torch.no_grad():
+
+                        _orig_use_adapter = teacher_model.use_zms_adapter
+                        teacher_model.use_zms_adapter = False
+                        try:
+
+
+                            teacher_inst, teacher_ion = resolve_condition_indices(
+                                batch, batch.zmol_target.size(0), args.device, config,
+                                force_mode=teacher_condition_mode,
+                            )
+                            t_kwargs = dict(
+                                node_types=batch.node_type.to(args.device),
+                                edge_index=batch.halfedge_index.to(args.device),
+                                batch_node=batch.node_type_batch.to(args.device),
+                                batch_edge=batch.halfedge_type_batch.to(args.device),
+                                instrument_type_idx=teacher_inst,
+                                ionization_type_idx=teacher_ion,
+                                cond_emb_cached=batch.zmol_target,
+                            )
+
+                            t_t = loss_dict.get('_t', None)
+                            t_theta = loss_dict.get('_theta', None)
+                            if t_t is not None and t_theta is not None:
+                                t_kwargs['t'] = t_t
+                                t_kwargs['edge_types_t'] = torch.zeros_like(batch.halfedge_type.to(args.device))
+                                t_kwargs['edge_theta'] = t_theta
+                                _ = teacher_model(**t_kwargs)
+                                teacher_logits = getattr(teacher_model, '_last_x0_logits', None)
+                            else:
+                                teacher_logits = None
+                        finally:
+                            teacher_model.use_zms_adapter = _orig_use_adapter
+
+
+                    student_logits = loss_dict.get('_edge_raw_logits', None)
+                    if teacher_logits is not None and student_logits is not None:
+                        # KL(student || teacher) with temperature
+                        T = kd_temperature
+                        s_log_softmax = F.log_softmax(student_logits / T, dim=-1)
+                        t_softmax = F.softmax(teacher_logits / T, dim=-1)
+                        kd_loss = F.kl_div(s_log_softmax, t_softmax, reduction='batchmean') * (T * T)
+                        loss = loss + kd_weight * kd_loss
+                        loss_dict['loss_kd'] = kd_loss.detach()
+                        if it < 10:
+                            logger.info(f"[Iter {it}] KD: {kd_loss.item():.4f}, "
+                                        f"weight={kd_weight}, T={T}")
+
+                    # ============================================================
+
+
+                    # ============================================================
+                    if kd_feature_weight > 0:
+                        s_layers = getattr(unwrap_model(model), '_last_layer_h_nodes', None)
+                        t_layers = getattr(teacher_model, '_last_layer_h_nodes', None)
+                        if s_layers is not None and t_layers is not None \
+                                and len(s_layers) == len(t_layers):
+                            n_layers = len(s_layers)
+
+                            if kd_feature_layers == 'all':
+                                layer_idx = list(range(n_layers))
+                            elif kd_feature_layers == 'last':
+                                layer_idx = [n_layers - 1]
+                            elif isinstance(kd_feature_layers, (list, tuple)):
+                                layer_idx = [i for i in kd_feature_layers if 0 <= i < n_layers]
+                            else:
+                                layer_idx = list(range(n_layers))
+
+                            feat_losses = []
+                            for i in layer_idx:
+                                feat_losses.append(F.mse_loss(s_layers[i], t_layers[i].detach()))
+                            feat_loss = sum(feat_losses) / max(1, len(feat_losses))
+                            loss = loss + kd_feature_weight * feat_loss
+                            loss_dict['loss_feat_kd'] = feat_loss.detach()
+                            if it < 10:
+                                logger.info(f"[Iter {it}] feature KD ({len(layer_idx)} layers): "
+                                            f"{feat_loss.item():.4f}, weight={kd_feature_weight}")
+
+            loss_dict['loss'] = loss
+
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning(f"[Iter {it}] Detected  NaN/Inf loss, skipping this update(this may indicate numerical overflow)")
+                optimizer.zero_grad()
+                continue
+
+            # ============================================================
+
+
+            #   2. graph2mol forward + backward
+
+            # ============================================================
+            if stage == 'joint' and g2m_loader is not None:
+                joint_cfg = getattr(config.train, 'joint', None) or {}
+                joint_get = (joint_cfg.get if isinstance(joint_cfg, dict) else
+                             lambda k, d=None: getattr(joint_cfg, k, d))
+                w_ms2 = float(joint_get('weight_ms2mol', 5.0))
+
+
+                (w_ms2 * loss).backward()
+                loss_dict['loss_ms2'] = loss.detach()
+
+
+                try:
+                    g2m_batch = next(g2m_iterator)
+                except (NameError, StopIteration):
+                    g2m_iterator = iter(g2m_loader)
+                    g2m_batch = next(g2m_iterator)
+                if g2m_batch is not None:
+                    _orig_stage = config.model.stage
+                    model_core_joint = unwrap_model(model)
+                    _orig_use_adapter = getattr(model_core_joint, 'use_zms_adapter', False)
+                    try:
+                        config.model.stage = 'graph2mol'
+
+                        model_core_joint.use_zms_adapter = False
+                        ld_g2m = train_flash(
+                            model, g2m_batch, args.device, config,
+                            iteration=None, logger=None,
+                        )
+                    finally:
+                        model_core_joint.use_zms_adapter = _orig_use_adapter
+                        config.model.stage = _orig_stage
+                    loss_g2m = ld_g2m['loss']
+                    if not (torch.isnan(loss_g2m) or torch.isinf(loss_g2m)):
+                        loss_g2m.backward()
+                        loss_dict['loss_g2m'] = loss_g2m.detach()
+
+                        loss_dict['loss'] = (loss_g2m.detach() + w_ms2 * loss.detach())
+                        if it < 10:
+                            logger.info(f"[Iter {it}] joint: loss_g2m={loss_g2m.item():.4f}, "
+                                        f"loss_ms2={loss.item():.4f}, w_ms2={w_ms2}, "
+                                        f"total={loss_dict['loss'].item():.4f}")
+                    else:
+                        logger.warning(f"[Iter {it}] g2m loss NaN/Inf, skipped g2m backward")
+            else:
+                loss.backward()
+        except RuntimeError as _e:
+            if _is_oom(_e):
+                oom_count += 1
+                logger.warning(f"[Iter {it}] CUDA OOM (cumulative {oom_count} times), skipping this step")
+                optimizer.zero_grad(set_to_none=True)
+                import gc; gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+            raise
+
+
+
+        model_core = unwrap_model(model)
+        if hasattr(model_core, 'spectrum_projector') and model_core.spectrum_projector is not None:
+            spec_grads = [p.grad.norm().item() for n, p in model_core.spectrum_projector.named_parameters() if p.grad is not None]
             if spec_grads:
                 writer.add_scalar('grad/spectrum_projector_mean', np.mean(spec_grads), it)
                 writer.add_scalar('grad/spectrum_projector_max', np.max(spec_grads), it)
 
-        # 1b. 原始质谱峰编码器梯度（origin模式）
-        if hasattr(model, 'peaks_encoder') and model.peaks_encoder is not None:
-            peaks_grads = [p.grad.norm().item() for n, p in model.peaks_encoder.named_parameters() if p.grad is not None]
+
+        if hasattr(model_core, 'peaks_encoder') and model_core.peaks_encoder is not None:
+            peaks_grads = [p.grad.norm().item() for n, p in model_core.peaks_encoder.named_parameters() if p.grad is not None]
             if peaks_grads:
                 writer.add_scalar('grad/peaks_encoder_mean', np.mean(peaks_grads), it)
                 writer.add_scalar('grad/peaks_encoder_max', np.max(peaks_grads), it)
 
-        # 2. 节点特征嵌入梯度
-        if hasattr(model, 'node_embedder'):
-            node_emb_grad = model.node_embedder.weight.grad
+
+        if hasattr(model_core, 'node_embedder'):
+            node_emb_grad = model_core.node_embedder.weight.grad
             if node_emb_grad is not None:
                 writer.add_scalar('grad/node_embedder', node_emb_grad.norm().item(), it)
 
-        # 3. 整体模型梯度
+
         all_grads = [p.grad.norm().item() for p in model.parameters() if p.grad is not None]
         if all_grads:
             writer.add_scalar('grad/total_mean', np.mean(all_grads), it)
             writer.add_scalar('grad/total_max', np.max(all_grads), it)
 
-        # 前10个iteration打印梯度debug信息
+
         if it < 10:
-            logger.info(f"[Iter {it}] 梯度分析:")
+            logger.info(f"[Iter {it}] Gradient analysis:")
 
-            # 质谱编码器梯度（dreams模式）
-            if hasattr(model, 'spectrum_projector') and model.spectrum_projector is not None:
-                spec_grads = [p.grad.norm().item() for n, p in model.spectrum_projector.named_parameters() if p.grad is not None]
+
+            if hasattr(model_core, 'spectrum_projector') and model_core.spectrum_projector is not None:
+                spec_grads = [p.grad.norm().item() for n, p in model_core.spectrum_projector.named_parameters() if p.grad is not None]
                 if spec_grads:
-                    logger.info(f"  [质谱编码器-dreams] 梯度范数: 均值={np.mean(spec_grads):.6f}, 最大={np.max(spec_grads):.6f}")
+                    logger.info(f"  [mass spectrumencoder-dreams] gradient norm: mean={np.mean(spec_grads):.6f}, maximum={np.max(spec_grads):.6f}")
 
-            # 原始质谱峰编码器梯度（origin模式）
-            if hasattr(model, 'peaks_encoder') and model.peaks_encoder is not None:
-                peaks_grads = [p.grad.norm().item() for n, p in model.peaks_encoder.named_parameters() if p.grad is not None]
+
+            if hasattr(model_core, 'peaks_encoder') and model_core.peaks_encoder is not None:
+                peaks_grads = [p.grad.norm().item() for n, p in model_core.peaks_encoder.named_parameters() if p.grad is not None]
                 if peaks_grads:
-                    logger.info(f"  [质谱编码器-origin] 梯度范数: 均值={np.mean(peaks_grads):.6f}, 最大={np.max(peaks_grads):.6f}")
+                    logger.info(f"  [mass spectrumencoder-origin] gradient norm: mean={np.mean(peaks_grads):.6f}, maximum={np.max(peaks_grads):.6f}")
 
-            if hasattr(model, 'condition_embedding'):
-                for name, param in model.condition_embedding.named_parameters():
+            if hasattr(model_core, 'condition_embedding'):
+                for name, param in model_core.condition_embedding.named_parameters():
                     if param.grad is not None:
-                        logger.info(f"  [条件嵌入] {name}: 梯度范数={param.grad.norm().item():.6f}")
+                        logger.info(f"  [condition embedding] {name}: gradient norm={param.grad.norm().item():.6f}")
 
             if hasattr(model, 'node_embedder') and node_emb_grad is not None:
-                logger.info(f"  [节点嵌入/分子式] 梯度范数={node_emb_grad.norm().item():.6f}")
+                logger.info(f"  [node embedding/Molecular formula] gradient norm={node_emb_grad.norm().item():.6f}")
 
-            if hasattr(model, 'edge_predictor') and model.edge_predictor is not None:
-                edge_grads = [p.grad.norm().item() for n, p in model.edge_predictor.named_parameters() if p.grad is not None]
+            if hasattr(model_core, 'edge_predictor') and model_core.edge_predictor is not None:
+                edge_grads = [p.grad.norm().item() for n, p in model_core.edge_predictor.named_parameters() if p.grad is not None]
                 if edge_grads:
-                    logger.info(f"  [边预测头] 梯度范数: 均值={np.mean(edge_grads):.6f}")
+                    logger.info(f"  [edge-prediction head] gradient norm: mean={np.mean(edge_grads):.6f}")
 
         if config.train.get('max_grad_norm'):
             clip_grad_norm_(model.parameters(), config.train.max_grad_norm)
 
         optimizer.step()
 
-        # ========== 打印和记录预测分布 ==========
+
         if '_edge_logits' in loss_dict and '_edge_types_true' in loss_dict:
             with torch.no_grad():
                 edge_logits = loss_dict['_edge_logits']
                 edge_types_true = loss_dict['_edge_types_true']
                 pred = edge_logits.argmax(dim=-1)
 
-                # BFN 模式：在所有边上计算准确率
+
                 pred_dist = torch.bincount(pred, minlength=5).tolist()
                 true_dist = torch.bincount(edge_types_true, minlength=5).tolist()
 
@@ -1220,7 +1872,7 @@ def main():
                 bond_mask = edge_types_true > 0
                 bond_acc = ((pred == edge_types_true) & bond_mask).sum().item() / bond_mask.sum().item() if bond_mask.sum() > 0 else 0
 
-                # 计算MolAcc（分子级完全匹配率）
+
                 batch_edge = loss_dict.get('_batch_edge', None)
                 if batch_edge is not None:
                     num_mols = batch_edge.max().item() + 1
@@ -1236,23 +1888,23 @@ def main():
                 else:
                     mol_acc = 0
 
-                # 打印分布
-                logger.info(f'  真实分布: {true_dist} | 预测分布: {pred_dist} | TotalAcc={total_acc:.4f} BondAcc={bond_acc:.4f} MolAcc={mol_acc:.4f}')
 
-                # 记录到TensorBoard
+                logger.info(f'  true distribution: {true_dist} | predicted distribution: {pred_dist} | TotalAcc={total_acc:.4f} BondAcc={bond_acc:.4f} MolAcc={mol_acc:.4f}')
+
+
                 writer.add_scalar('train/total_acc', total_acc, it)
                 writer.add_scalar('train/bond_acc', bond_acc, it)
                 writer.add_scalar('train/mol_acc', mol_acc, it)
 
-                # 根据配置决定是否绘制边类型分布图
+
                 if config.train.get('log_edge_distribution', True):
-                    # 创建分布对比图（一张图显示真实和预测分布）
+
                     fig, ax = plt.subplots(figsize=(10, 6))
                     x = np.arange(5)
                     width = 0.35
                     edge_type_names = ['NoBond(0)', 'Single(1)', 'Double(2)', 'Triple(3)', 'Aromatic(4)']
 
-                    # 归一化为比例
+
                     total_true = sum(true_dist)
                     total_pred = sum(pred_dist)
                     true_ratio = [t/total_true if total_true > 0 else 0 for t in true_dist]
@@ -1269,7 +1921,7 @@ def main():
                     ax.legend()
                     ax.set_ylim(0, 1.0)
 
-                    # 在柱子上显示数值
+
                     for bar, val in zip(bars1, true_dist):
                         ax.annotate(f'{val}', xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
                                    ha='center', va='bottom', fontsize=8, color='steelblue')
@@ -1281,7 +1933,7 @@ def main():
                     writer.add_figure('distribution/edge_type_comparison', fig, it)
                     plt.close(fig)
 
-            # 清理临时数据
+
             del loss_dict['_edge_logits']
             del loss_dict['_edge_types_true']
             if '_batch_edge' in loss_dict:
@@ -1297,90 +1949,169 @@ def main():
                 else:
                     writer.add_scalar(f'train/{key}', value, it)
 
-        # 验证
-        if it % config.train.val_freq == 0 and it > 0:
-            model.eval()
 
-            # 验证逻辑
-            val_loss_dict_list = []
+        if it % config.train.val_freq == 0 and it > 0:
+            val_loss_for_scheduler = None
+            eval_model = unwrap_model(model)
+            eval_model.eval()
+
+            if distributed:
+                val_local_indices = list(range(rank, len(val_subset), world_size))
+                val_eval_dataset = torch.utils.data.Subset(val_subset, val_local_indices)
+            else:
+                val_eval_dataset = val_subset
 
             val_loader_subset = DataLoader(
-                val_subset,
-                batch_size=config.train.batch_size,
+                val_eval_dataset,
+                batch_size=main_batch_size,
                 shuffle=False,
                 num_workers=config.train.num_workers,
                 pin_memory=config.train.pin_memory,
                 collate_fn=collate_fn
             )
 
-            logger.info(f'[{it}] 开始验证...')
+            if is_main:
+                logger.info(f'[{it}] Starting validation...')
+                logger.info(
+                    f'[{it}] distributionformulavalidation: Total samples={len(val_subset)}, '
+                    f'world_size={world_size if distributed else 1}, rank0samplethis ={len(val_eval_dataset)}'
+                )
+
+            val_seed = int(config.train.get('seed', 0)) + int(it) * 1009 + rank * 1000003
+            torch.manual_seed(val_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(val_seed)
+
+            val_metric_keys = ['bfn_loss', 'total', 'loss']
+            val_sums = {key: 0.0 for key in val_metric_keys}
+            val_count = 0
             with torch.no_grad():
-                val_pbar = tqdm(val_loader_subset, desc=f'验证 iter {it}', leave=False)
+                val_pbar = tqdm(
+                    val_loader_subset,
+                    desc=f'validation iter {it}' if not distributed else f'validation iter {it} rank{rank}',
+                    leave=False,
+                    disable=distributed and not is_main,
+                )
                 for val_batch in val_pbar:
-                    val_loss_dict = train_flash(model, val_batch, args.device, config)
-                    # 跳过以_开头的临时数据
-                    val_loss_dict_list.append({k: v.item() for k, v in val_loss_dict.items() if not k.startswith('_')})
-                    val_pbar.set_postfix({'loss': val_loss_dict['loss'].item()})
+                    if val_batch is None:
+                        continue
+                    val_loss_dict = train_flash(eval_model, val_batch, args.device, config)
+                    for key in val_metric_keys:
+                        if key in val_loss_dict:
+                            value = val_loss_dict[key]
+                            val_sums[key] += float(value.item() if torch.is_tensor(value) else value)
+                    val_count += 1
+                    if 'loss' in val_loss_dict:
+                        val_pbar.set_postfix({'loss': val_loss_dict['loss'].item()})
 
-            avg_val_losses = {}
-            for key in val_loss_dict_list[0].keys():
-                avg_val_losses[key] = sum([d[key] for d in val_loss_dict_list]) / len(val_loss_dict_list)
-
-            val_loss_str = ' '.join([f'{key}={value:.4f}' for key, value in avg_val_losses.items()])
-            logger.info(f'[{it}] 验证损失: {val_loss_str}')
-
-            for key, value in avg_val_losses.items():
-                writer.add_scalar(f'val/{key}', value, it)
-
-            # ========== 重建评估：为每个样本生成多个结果，计算Top-K准确率 ==========
-            eval_num_samples = config.train.get('eval_num_samples', 100)
-            logger.info(f'[{it}] 开始重建评估（每个样本生成{eval_num_samples}个结果）...')
-            recon_metrics = evaluate_reconstruction(
-                model=model,
-                val_dataset=val_subset,  # 使用本次随机采样的子集
+            val_reduce = torch.tensor(
+                [val_sums['bfn_loss'], val_sums['total'], val_sums['loss'], float(val_count)],
+                dtype=torch.float64,
                 device=args.device,
-                config=config,
-                mode=mode,
-                atomic_numbers=atomic_numbers,
-                logger=logger,
-                collate_fn=collate_fn,  # 传入collate函数
-                num_samples=eval_num_samples
             )
-            # 记录重建指标到TensorBoard（用 .get 兜底，align 阶段缺某些字段也不会崩）
-            writer.add_scalar('val/recon_success_rate', recon_metrics.get('recon_success_rate', 0.0), it)
-            writer.add_scalar('val/edge_accuracy', recon_metrics.get('edge_accuracy', 0.0), it)
-            writer.add_scalar('val/bond_accuracy', recon_metrics.get('bond_accuracy', 0.0), it)
-            writer.add_scalar('val/mol_accuracy', recon_metrics.get('mol_accuracy', 0.0), it)
-            # align 阶段独有指标
-            if 'pairwise_top1' in recon_metrics:
-                writer.add_scalar('val/pairwise_top1', recon_metrics['pairwise_top1'], it)
-            if 'cos_sim_mean' in recon_metrics:
-                writer.add_scalar('val/cos_sim_mean', recon_metrics['cos_sim_mean'], it)
-            # Top-K 指标（仅 graph2mol/ms2mol 有）
-            if 'top1_mol_accuracy' in recon_metrics:
-                writer.add_scalar('val/top1_mol_accuracy', recon_metrics['top1_mol_accuracy'], it)
-            if 'top10_mol_accuracy' in recon_metrics:
-                writer.add_scalar('val/top10_mol_accuracy', recon_metrics['top10_mol_accuracy'], it)
-            # ==========================================================
+            if distributed:
+                dist.all_reduce(val_reduce, op=dist.ReduceOp.SUM)
 
-            if scheduler:
-                scheduler.step(avg_val_losses['loss'])
+            global_val_count = int(val_reduce[3].item())
+            if global_val_count == 0:
+                if is_main:
+                    logger.warning(f'[{it}] all validation-set  batch were all filtered, skipping this validation pass/reconstruction evaluation')
+            else:
+                avg_val_losses = {
+                    'bfn_loss': val_reduce[0].item() / global_val_count,
+                    'total': val_reduce[1].item() / global_val_count,
+                    'loss': val_reduce[2].item() / global_val_count,
+                }
+                val_loss_for_scheduler = avg_val_losses.get('loss', None)
 
-        # 保存checkpoint
+                if is_main:
+                    val_loss_str = ' '.join([f'{key}={value:.4f}' for key, value in avg_val_losses.items()])
+                    logger.info(f'[{it}] validation loss: {val_loss_str}')
+
+                    for key, value in avg_val_losses.items():
+                        writer.add_scalar(f'val/{key}', value, it)
+
+
+                    eval_num_samples = config.train.get('eval_num_samples', 100)
+                    logger.info(f'[{it}] Starting reconstruction evaluation(per  samplethis generate{eval_num_samples} results)...')
+                    recon_metrics = evaluate_reconstruction(
+                        model=eval_model,
+                        val_dataset=val_subset,
+                        device=args.device,
+                        config=config,
+                        mode=mode,
+                        atomic_numbers=atomic_numbers,
+                        logger=logger,
+                        collate_fn=collate_fn,
+                        num_samples=eval_num_samples,
+                        distributed=distributed,
+                        rank=rank,
+                        world_size=world_size,
+                        eval_iteration=it,
+                    )
+                else:
+                    eval_num_samples = config.train.get('eval_num_samples', 100)
+                    recon_metrics = evaluate_reconstruction(
+                        model=eval_model,
+                        val_dataset=val_subset,
+                        device=args.device,
+                        config=config,
+                        mode=mode,
+                        atomic_numbers=atomic_numbers,
+                        logger=logger,
+                        collate_fn=collate_fn,
+                        num_samples=eval_num_samples,
+                        distributed=distributed,
+                        rank=rank,
+                        world_size=world_size,
+                        eval_iteration=it,
+                    )
+
+                if is_main:
+
+                    writer.add_scalar('val/recon_success_rate', recon_metrics.get('recon_success_rate', 0.0), it)
+                    writer.add_scalar('val/edge_accuracy', recon_metrics.get('edge_accuracy', 0.0), it)
+                    writer.add_scalar('val/bond_accuracy', recon_metrics.get('bond_accuracy', 0.0), it)
+                    writer.add_scalar('val/mol_accuracy', recon_metrics.get('mol_accuracy', 0.0), it)
+
+                    if 'pairwise_top1' in recon_metrics:
+                        writer.add_scalar('val/pairwise_top1', recon_metrics['pairwise_top1'], it)
+                    if 'cos_sim_mean' in recon_metrics:
+                        writer.add_scalar('val/cos_sim_mean', recon_metrics['cos_sim_mean'], it)
+
+                    if 'top1_mol_accuracy' in recon_metrics:
+                        writer.add_scalar('val/top1_mol_accuracy', recon_metrics['top1_mol_accuracy'], it)
+                    if 'top10_mol_accuracy' in recon_metrics:
+                        writer.add_scalar('val/top10_mol_accuracy', recon_metrics['top10_mol_accuracy'], it)
+                    # ==========================================================
+
+            if distributed:
+                ddp_barrier(distributed)
+
+            if scheduler and val_loss_for_scheduler is not None:
+                scheduler.step(val_loss_for_scheduler)
+
+
         if it % config.train.save_freq == 0 and it > 0:
-            ckpt_path = os.path.join(ckpt_dir, f'{mode_with_spectrum}_iter{it}.pt')
-            torch.save({
-                'config': config,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict() if scheduler else None,
-                'iteration': it,
-                'mode': mode,
-                'stage': stage,
-            }, ckpt_path)
-            logger.info(f'保存checkpoint: {ckpt_path}')
+            if is_main:
+                ckpt_path = os.path.join(ckpt_dir, f'{mode_with_spectrum}_iter{it}.pt')
+                torch.save({
+                    'config': config,
+                    'model': unwrap_model(model).state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict() if scheduler else None,
+                    'iteration': it,
+                    'mode': mode,
+                    'stage': stage,
+                }, ckpt_path)
+                logger.info(f'Saving checkpoint: {ckpt_path}')
+            ddp_barrier(distributed)
 
-    logger.info('训练完成!')
+    logger.info('Training complete!')
+    writer.close()
+    if distributed:
+        ddp_barrier(distributed)
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':

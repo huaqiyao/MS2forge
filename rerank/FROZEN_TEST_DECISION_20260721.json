@@ -1,0 +1,102 @@
+{
+  "schema": "ms2forge.postfreeze_single_blind_test_freeze.v1",
+  "created_at": "2026-07-21T18:12:00+08:00",
+  "status": "FROZEN_FOR_ONE_MSG_TEST_EVALUATION",
+  "test_result_at_freeze": "unknown",
+  "policy": {
+    "selection_data": "train plus validation only",
+    "test_use": "one inference-only application followed by FLASH-UEP-v1.0 evaluation",
+    "post_test_tuning": "prohibited",
+    "seed_policy": "seed 2026 was the predeclared primary model; seeds 2027 and 2028 are stability audits and were not searched for the best seed",
+    "replacement_guard": "Report every metric. The new model is eligible to replace EvidenceRank-full only if Top-1 and Top-10 exact counts do not decrease, with at least one predeclared accuracy or structural-similarity endpoint improving. No parameter may change after opening test."
+  },
+  "selected_pipeline": {
+    "generator": "original frozen MS2Forge generator; RankAlign excluded",
+    "evidence_head": "EvidenceRank-full",
+    "stage_a": {
+      "variant": "ER-SimRank-E8-A8",
+      "evidencerank_weight": 0.95,
+      "similarity_weight": 0.05,
+      "model": "rerank/artifacts/stage_a_model.pkl",
+      "model_sha256": "c2efb2eb1045e21055395d7a1e4c094e433db1eb822dbbc109fd7d0bd1de6cec",
+      "validation_score_sha256": "6c178bb6801495b1f968ea4daf9617cb1d9b77c30ed07f53cd8303d32ba6ae0c"
+    },
+    "ssr": {
+      "variant": "ContrastiveTan",
+      "seed": 2026,
+      "stage_a_weight": 0.8,
+      "neural_weight": 0.2,
+      "checkpoint": "rerank/artifacts/ssr_contrastive_tan_best.pt",
+      "checkpoint_sha256": "f2eaf3b1581101a6f9f02fd16b52e4dc4516578d4a617f46b48d1ba0f22d5973",
+      "validation_neural_score_sha256": "04edf9bb01e77aaae7988879e8fde0fa58f471df78da10331ac42408d2bd256c",
+      "validation_final_score_sha256": "1d7288ded75accc36ddee9f80e692eab03639c6ff7aef338db429a79012555fa"
+    }
+  },
+  "validation_evidence": {
+    "stage_a": {
+      "n_spectra": 18961,
+      "top1_accuracy": 0.29397183692843204,
+      "top10_accuracy": 0.3888507990084911,
+      "tanimoto_top1": 0.5497430465368509,
+      "tanimoto_top10": 0.633450556786245
+    },
+    "ssr_seed_2026": {
+      "top1_accuracy": 0.29666156848267494,
+      "top10_accuracy": 0.38900901851168185,
+      "tanimoto_top1": 0.5515151742981905,
+      "tanimoto_top10": 0.6341056774574686
+    },
+    "ssr_seed_2027": {
+      "top1_accuracy": 0.2951848531195612,
+      "top10_accuracy": 0.38895627867728494,
+      "tanimoto_top1": 0.5506610334842087,
+      "tanimoto_top10": 0.6339596922156833,
+      "selection_summary_sha256": "d6b89924d6111fd4671f320cebb9d2b93830e2ae221fb65f6116f06bfc208695"
+    },
+    "ssr_seed_2028": {
+      "top1_accuracy": 0.2965033489794842,
+      "top10_accuracy": 0.38916723801487263,
+      "tanimoto_top1": 0.5514169700253235,
+      "tanimoto_top10": 0.634194478838942,
+      "selection_summary_sha256": "4d6d74c7c323902a18487ad76e74673fb37331c0987944872794a1f641742df2"
+    }
+  },
+  "excluded_posttraining": {
+    "variant": "RankAlign-Reweight-R8",
+    "decision": "REJECTED_ON_VALIDATION; MUST_NOT ENTER TEST",
+    "reason": "Candidate recall, exact Top-1, exact Top-10, Tanimoto@1 and Tanimoto@10 all decreased with paired confidence intervals below zero.",
+    "comparison_sha256": "7b524074fc211cea2a2dde70449eb0ab18108cdaf01ca5ad1a8b0beddb4f05de"
+  },
+  "test_inputs": {
+    "representation": "canonical_smiles",
+    "fixed_denominator": 17556,
+    "test_manifest": "rerank/artifacts/msg_test.tsv",
+    "test_manifest_sha256": "8ff6e584348f91d10420ec9b25f32327e7e7bdb4208ace77135f82c7e32e3913",
+    "stage_a_candidate_table": "rerank/artifacts/stage_a_candidate_table.tsv",
+    "stage_a_candidate_table_sha256": "bcf1c240994f82b122d0b67d9b36e4f06b6d7037e680b0eac5d5cb1fcc3264ae",
+    "ssr_candidate_table": "rerank/artifacts/ssr_candidate_table.tsv",
+    "ssr_candidate_table_sha256": "9979892df48430dbbaa00171f456a74a370c1f370c72f7cdb2a1a34b258a66fd",
+    "frozen_evidencerank_scores": "rerank/artifacts/evidencerank_test_scores.tsv",
+    "frozen_evidencerank_scores_sha256": "cacf27c77ce1b402a567ed935b10e9aaa489071170f1599f0d4492f5231dfe0f",
+    "labels_sha256": "feb8c9c58be5ced28c2e370f196638610c013cc656d77eebfbe5d42d215ae8fb",
+    "split_table_sha256": "5b049fd52855eb491719bd3038fb1643c662fa0071367b1fd36a280b268a21e4"
+  },
+  "inference_script": {
+    "path": "rerank/ms2forge_apply_frozen_test.py",
+    "sha256": "38376200c394b3557b16e64b14474dc3ea1352857be806c79436316241e25608"
+  },
+  "uep_scripts": {
+    "export_ranked_topk_sha256": "3a893bc2dce81b8be426981b71906adaf305d7726ae2d68403166d51fef5cad8",
+    "evaluate_protocol_v1_sha256": "dbc251ff76f252a7df7dc1835de737abdc2c6ce2136ff42f32d4774bd4a226b7",
+    "summarize_protocol_pre_mces_sha256": "ed51eaac78c3ada4536df256a9fc42bfea81215f8629614081700ae2f47e4ebb"
+  },
+  "reference_test_metrics": {
+    "model": "EvidenceRank-full",
+    "top1_accuracy_percent": 23.980405559352928,
+    "top1_mces": 11.454801777170198,
+    "top1_tanimoto": 0.4833695104102142,
+    "top10_accuracy_percent": 32.02323991797676,
+    "top10_mces": 9.84908293460925,
+    "top10_tanimoto": 0.5678427891247221
+  }
+}

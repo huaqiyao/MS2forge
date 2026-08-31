@@ -1,0 +1,38 @@
+{
+  "included_in_release": false,
+  "reason": "dataset excluded from the requested release scope; code and exact provenance are retained",
+  "graph2mol": {
+    "file": "data/pretrain/pretrain_smiles.csv",
+    "source_path": "data/pretrain/pretrain_smiles.csv",
+    "bytes": 178368629,
+    "lines_including_header": 3319611,
+    "records": 3319610,
+    "sha256": "f64ce2840d787ed0246eb7e7649267cba0f61c90e305ec0866d38b3794fde3bc",
+    "columns": ["smiles", "source", "split"],
+    "split_counts": {"train": 3313429, "val": 3184, "test": 2997},
+    "source_counts": {"msg": 28924, "hmdb": 163784, "dsstox": 865268, "coconut": 357050, "moses": 1904584},
+    "derived_lmdb": {
+      "file": "processed_smiles_pretrain_smiles_maxinf_atoms13.lmdb",
+      "bytes": 14449508352,
+      "entries": 3319610,
+      "sha256": "7b55fa7260b5f6a5cbaa266952a3c51de77bf03d719150e855b537dd7da2b32c"
+    },
+    "derived_keys": {
+      "file": "processed_smiles_pretrain_smiles_maxinf_atoms13_keys.pt",
+      "bytes": 129478676,
+      "sha256": "8596446844c781a8abe26d9c577361b11947d9c8d565d6d84b903d0c05510af0"
+    }
+  },
+  "ms2mol": {
+    "root": "data/msg_diffms",
+    "source_path": "data/msg_diffms",
+    "records": 231104,
+    "split_counts": {"train": 194119, "val": 19429, "test": 17556},
+    "labels_tsv": {"bytes": 30458741, "sha256": "feb8c9c58be5ced28c2e370f196638610c013cc656d77eebfbe5d42d215ae8fb"},
+    "split_tsv": {"bytes": 6183405, "sha256": "5b049fd52855eb491719bd3038fb1643c662fa0071367b1fd36a280b268a21e4"},
+    "spec_files": {"files": 231104, "payload_bytes": 318107215, "stable_tree_sha256": "156cb668e1cf082fb2771c56ffeefaddd4e904cf5c501b3aa1bed08024ed3866"},
+    "subformula_json": {"files": 231104, "payload_bytes": 988647584, "stable_tree_sha256": "05c1e983c813b101d03912cf1e0d4203482061807904d0da94aa5f5846e81628"},
+    "atom_types_txt": {"bytes": 200, "sha256": "009348306faf254b7070e4ab8b5c81216dd27bae23fb8cf1dad8e5a5c777d4c2"},
+    "edge_types_txt": {"bytes": 125, "sha256": "056bf01e9eb6bc1fafb0a65ffb1bce91fbb2c593e3a9a8f7d4d948641d9cf954"}
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "run_date": "2026-08-06",
+  "host": "Linux CUDA host",
+  "status": "passed_with_environment_solver_note",
+  "checks": {
+    "python_ast_files": 19,
+    "yaml_files": 6,
+    "json_files_before_generated_reports": 4,
+    "bash_launchers": "passed bash -n",
+    "entrypoint_imports": ["scripts/train.py --help", "scripts/sample.py --help"],
+    "release_contract_tests": "3/3 passed",
+    "full_sha256_and_checkpoint_verification": "passed",
+    "msg_dataset": {"records": 231104, "train": 194119, "val": 19429, "test": 17556, "sample_read": true},
+    "graph_dataset": {"records": 3319610, "train": 3313429, "val": 3184, "test": 2997, "sample_read": true},
+    "zms_collate": {"shape": [1, 512], "zmol_target_shape": [1, 512], "passed": true},
+    "ms2mol_cpu_forward": {"checkpoint": "ms2mol_iter80000.pt", "loss": 0.000022732712750439532, "finite": true},
+    "graph2mol_cpu_forward": {"checkpoint": "graph2mol_iter1460000.pt", "conditioning": "synthetic zero vector for pipeline smoke test", "loss": 0.183222696185112, "finite": true},
+    "pyg_wheel_urls": "all five returned HTTP 200"
+  },
+  "environment_note": "conda dry-run did not finish within the 180 second command timeout; the existing source environment executed all checks, direct PyG wheel URLs were verified, and environment_lock.yml records the exact installed package snapshot"
+}

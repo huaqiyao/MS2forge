@@ -1,0 +1,63 @@
+# Runnable Graph2Mol reproduction config for graph2mol_iter1460000.pt.
+# Architecture and optimization fields match the checkpoint's embedded config.
+# max_iters is set to 1460001 because iteration numbering starts at zero.
+model:
+  stage: graph2mol
+  align_ckpt_path: ./checkpoints/align.pt
+  contrastive_dim: 512
+  node_dim: 256
+  noise_scale: 0.0
+  condition_embedding: {embed_dim: 256}
+  ms_encoder:
+    dim_sos: 13
+    dim_formula: 144
+    hidden_dim: 512
+    num_transformer_layers: 3
+    nhead: 8
+    dropout: 0.1
+    input_dropout: 0.1
+    max_len: 129
+  graph_encoder: {n_layers: 4}
+  gat: {hidden_dim: 512, num_layers: 6, dropout: 0.15}
+  flow: {n_timesteps: 100, eval_n_timesteps: 20}
+  flash: {beta1: 3.0}
+
+train:
+  seed: 2026
+  batch_size: 16
+  num_workers: 0
+  pin_memory: false
+  max_iters: 1460001
+  val_freq: 2000
+  save_freq: 20000
+  max_grad_norm: 50.0
+  warmup_iters: 500
+  val_subset_ratio: 0.1
+  eval_batch_size: 32
+  eval_num_samples: 1
+  eval_split: val
+  eval_mode: strict
+  log_edge_distribution: false
+  ms2mol:
+    adapter: {enabled: false, hidden_dim: 1024, mse_weight: 0.5, dropout: 0.1}
+    distill: {enabled: false, teacher_ckpt: '', weight: 1.0, temperature: 2.0, feature_weight: 0.5, feature_layers: all}
+  joint: {weight_ms2mol: 5.0, batch_size_g2m: 64, batch_size_ms2: 64}
+  optimizer: {type: adamw, lr: 5.0e-5, weight_decay: 1.0e-4, beta1: 0.99, beta2: 0.999}
+  scheduler: {type: plateau, factor: 0.8, patience: 1000, min_lr: 1.0e-6}
+
+transform: {use_mask_node: true, use_mask_edge: false}
+
+dataset:
+  name: smiles
+  root: ./data/pretrain
+  smiles_file: ./data/pretrain/pretrain_smiles.csv
+  max_atoms: null
+  split_seed: 2026
+  split_ratio: [0.95, 0.025, 0.025]
+  data_subset_ratio: 1.0
+  cache_dir: ./data/cache
+  atomic_numbers: [5, 6, 7, 8, 9, 14, 15, 16, 17, 33, 34, 35, 53]
+
+chem:
+  atomic_numbers: [5, 6, 7, 8, 9, 14, 15, 16, 17, 33, 34, 35, 53]
+  mol_bond_types: [1, 2, 3, 4]

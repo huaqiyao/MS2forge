@@ -1,82 +1,42 @@
-# FLASH 推理/评估配置（ms2mol 阶段专用）
-# 任务：MS + formula → 分子 2D 结构
-# 流程：
-#   1) align ckpt → ms_encoder(spec, formula) → Zms 缓存
-#   2) ms2mol ckpt + Zms → BFN 边类型采样 (每谱 n_samples 个候选)
-#   3) DiffMS 风格 Top-K 评估：候选按频率排序去重，
-#      "前 k 个候选里命中真实边类型序列"算 top-k 命中
-#   注意：本评估不重建分子（不调 RDKit），直接比对边类型张量；
-#   逻辑与 DiffMS metrics.diffms_metrics.K_ACC_Collection 一致，
-#   只是把 InChI 字符串替换为边类型 tuple 作为"分子身份"。
-
+# Final MS2Forge 80k evaluation configuration.
+# This file bakes in the verified full-test protocol used on 2026-07-11.
 model:
   stage: ms2mol
-  contrastive_dim: 512        # 必须 = 512 兼容 DeniMS ckpt
+  contrastive_dim: 512
   node_dim: 256
   noise_scale: 0.0
-
-  condition_embedding:
-    embed_dim: 256
-
-  ms_encoder:
-    dim_sos: 13
-    dim_formula: 144
-    hidden_dim: 512
-    num_transformer_layers: 3
-    nhead: 8
-    dropout: 0.1
-    input_dropout: 0.1
-    max_len: 129
-
-  graph_encoder:
-    n_layers: 4
-
-  gat:
-    hidden_dim: 256
-    num_layers: 4
-    dropout: 0.15
-
-  flow:
-    n_timesteps: 100         # 推理 BFN 步数（独立于 n_samples）
-
-  flash:
-    beta1: 3.0
-
-  freeze_ms_encoder: false   # 推理不影响
-
-# 数据集配置
+  condition_embedding: {embed_dim: 256}
+  ms_encoder: {dim_sos: 13, dim_formula: 144, hidden_dim: 512, num_transformer_layers: 3, nhead: 8, dropout: 0.1, input_dropout: 0.1, max_len: 129}
+  graph_encoder: {n_layers: 4}
+  gat: {hidden_dim: 512, num_layers: 6, dropout: 0.15}
+  flow: {n_timesteps: 20}
+  flash: {beta1: 3.0}
 dataset:
   name: msg_diffms
   root: ./data/msg_diffms
   data_split_mode: split
   instrument_type: all
   max_peaks: 128
-
+  cache_dir: ./data/cache
 chem:
   atomic_numbers: [5, 6, 7, 8, 9, 14, 15, 16, 17, 33, 34, 35, 53]
   mol_bond_types: [1, 2, 3, 4]
-
-transform:
-  use_mask_node: true
-  use_mask_edge: false
-
-# 评估配置
+transform: {use_mask_node: true, use_mask_edge: false}
 evaluate:
-  split: test                # test / val / train
-  batch_size: 32             # 每 batch 多少 spec
-  n_samples: 100             # ★ 每谱采样多少个候选（DiffMS 默认 100）
-  n_timesteps: 20            # ★ BFN 采样步数
-  subset_ratio: 1.0          # ★ 1.0 = 全集；调小可快速 smoke
-  topk: [1, 5, 10]           # 要报告的 top-k 列表
-  valid_check: true          # 是否做 DiffMS 风格的化学合理性检查（valence + connectivity）
-                             # true: 不合理的候选先丢弃再排频次（与 DiffMS K_ACC 等价）
-                             # false: 不做检查，所有候选都参与（速度快但 top-k 偏高）
-  inner_chunk: 25            # 单次 sample_bfn 最大复制次数（OOM 保护；100 sample 自动分 4 chunk）
+  split: test
+  subset_ratio: 1.0
+  n_samples: 100
+  n_timesteps: 20
+  eval_mode: diffms_2d
+  condition_mode: real
+  condition_source: zms
+  batch_size: 16
+  topk: [1, 5, 10]
+  inner_chunk: 20
   seed: 2026
-  output_dir: ./eval_results
-  save_per_spec: false       # 是否把每条 spec 的预测/真值存盘（用于二次分析）
-
-# Checkpoint 路径（命令行可覆盖）
+  output_dir: ./evaluation/generated_80k
+  save_per_spec: false
+  save_candidate_cache: true
 ckpt:
-  ms2mol: ./checkpoints/ms2mol/ms2mol_iter72000.pt    # ★ 默认评估这个
-  align:  ./checkpoints/Encoder_Contrastive_FragHub.pth
+  ms2mol: ./checkpoints/ms2mol_iter80000.pt
+  align: ./checkpoints/align.pt

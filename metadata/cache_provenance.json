@@ -1,0 +1,32 @@
+{
+  "release_date": "2026-08-06",
+  "source_logical_root": "data/cache",
+  "source_physical_root": "data/cache",
+  "align_checkpoint": {
+    "file": "checkpoints/align.pt",
+    "sha256": "a29c443dde401cbd97911fa7e56a835cc156af7768346febbace6317b8d940db"
+  },
+  "note": "cache files do not embed the align hash; this manifest records the association established from training logs and source-file hashes",
+  "files": [
+    {
+      "file": "data/cache/zms_v1.pt",
+      "bytes": 304977558,
+      "sha256": "5b2e37cbda6e6ef8f70e66c2d6e5b5570e0449ad08d7f30e8f1af02a12fc247c",
+      "entries": 230692,
+      "value_shape": [512],
+      "dtype": "float16"
+    },
+    {
+      "file": "data/cache/zmol_v1.pt",
+      "bytes": 4463726086,
+      "sha256": "10aeb77702f9cfb1e7392d4ddeeb9c2fdbcf5664427be684824f3c22f07179c5",
+      "entries": 3317110
+    },
+    {
+      "file": "data/cache/zmol_v1.pt.ready",
+      "bytes": 18,
+      "sha256": "0e0137d662fbf47c1d38f7bb43de90cf589517aebb3b487517054df1a8f63457",
+      "role": "historical DDP synchronization marker"
+    }
+  ]
+}
