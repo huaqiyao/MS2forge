@@ -36,5 +36,5 @@ evaluate:
   save_per_spec: false
   save_candidate_cache: true
 ckpt:
-  ms2mol: ./checkpoints/nplib1/ms2mol_best.pt
-  align: ./checkpoints/nplib1/align_best.pt
+  ms2mol: ./checkpoints/nplib1/ms2mol.pt
+  align: ./checkpoints/nplib1/alignment.pt

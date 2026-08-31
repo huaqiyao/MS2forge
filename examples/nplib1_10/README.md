@@ -40,8 +40,8 @@ top10: 10/10
 ## Model inference
 
 ```bash
-export MS2MOL_CKPT=/absolute/path/to/ms2mol_best.pt
-export ALIGN_CKPT=/absolute/path/to/align_best.pt
+export MS2MOL_CKPT=/absolute/path/to/ms2mol.pt
+export ALIGN_CKPT=/absolute/path/to/alignment.pt
 bash examples/nplib1_10/run_inference.sh
 ```
 

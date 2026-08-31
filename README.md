@@ -33,14 +33,11 @@ annotations, a ten-entry Zms cache, and frozen candidate results.
 python examples/nplib1_10/run_demo.py
 ```
 
-Expected metrics are Top-1 9/10, Top-5 10/10, and Top-10 10/10. The subset is
-a curated functional demonstration and is not an unbiased benchmark estimate.
-
 To rerun model inference, provide the MS2Mol and alignment checkpoints:
 
 ```bash
-export MS2MOL_CKPT=/absolute/path/to/ms2mol_best.pt
-export ALIGN_CKPT=/absolute/path/to/align_best.pt
+export MS2MOL_CKPT=/absolute/path/to/ms2mol.pt
+export ALIGN_CKPT=/absolute/path/to/alignment.pt
 bash examples/nplib1_10/run_inference.sh
 ```
 
