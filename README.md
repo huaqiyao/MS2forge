@@ -78,7 +78,7 @@ rerank/artifacts/
 ## Repository structure
 
 ```text
-benchmarks/   Benchmark adapters
+assets/       Model architecture figure
 configs/      Training and inference configurations
 docs/         Code map and reproducibility contract
 evaluation/   Frozen evaluation summaries
@@ -94,14 +94,19 @@ utils/        Data, chemistry, reconstruction, and evaluation utilities
 
 ## Data attribution
 
-NPLIB1, also known as the CANOPUS training dataset, was prepared from public
-GNPS spectra. Publications using the demonstration data should cite GNPS and
-CANOPUS:
-
-- Wang, M. et al. *Nature Biotechnology* **34**, 828--837 (2016).
-  https://doi.org/10.1038/nbt.3597
-- Dührkop, K. et al. *Nature Biotechnology* **39**, 462--471 (2021).
-  https://doi.org/10.1038/s41587-020-0740-8
+All datasets used in this work are publicly available. The MassSpecGym (MSG)
+benchmark was obtained from its public release (Bushuiev et al., NeurIPS 2024)
+at [https://huggingface.co/datasets/roman-bushuiev/MassSpecGym](https://huggingface.co/datasets/roman-bushuiev/MassSpecGym)
+(code: [https://github.com/pluskal-lab/MassSpecGym](https://github.com/pluskal-lab/MassSpecGym)).
+The NPLIB1 dataset (also referred to as CANOPUS, derived from public GNPS
+spectra; Goldman et al., 2023) was used with the same train/validation/test
+splits as DiffMS and can be reproduced with the data-processing scripts at
+[https://github.com/coleygroup/DiffMS](https://github.com/coleygroup/DiffMS).
+Spectra for encoder pretraining were assembled using the FragHub
+library-integration workflow (Dablanc et al., Anal. Chem. 2024;
+[https://github.com/eMetaboHUB/FragHub](https://github.com/eMetaboHUB/FragHub)),
+which harmonizes open mass-spectral libraries. For both MSG and NPLIB1 we
+adopt the identical data splits as DiffMS to ensure a fair comparison.
 
 ## License
 
