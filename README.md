@@ -70,8 +70,8 @@ and checkpoints at the paths defined by the YAML configurations:
 
 ```text
 checkpoints/align.pt
-checkpoints/graph2mol_iter1460000.pt
-checkpoints/ms2mol_iter80000.pt
+checkpoints/graph2mol.pt
+checkpoints/ms2mol.pt
 data/cache/zms_v1.pt
 data/cache/zmol_v1.pt
 data/msg_diffms/
