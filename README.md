@@ -1,5 +1,9 @@
 # MS2Forge
 
+<p align="center">
+  <img src="assets/ms2forge_bayesian_generation_black_prior.gif" width="900">
+</p>
+
 MS2Forge generates molecular structures from tandem mass spectra with a
 Bayesian Flow Network (BFN) and ranks generated candidates using fragment
 evidence and spectrum--structure compatibility.
