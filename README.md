@@ -1,7 +1,7 @@
 # MS2Forge
 
 <p align="center">
-  <img src="assets/ms2forge_bayesian_generation_black_prior.gif" width="900">
+  <img src="assets/ms2forge.gif" width="900">
 </p>
 
 MS2Forge generates molecular structures from tandem mass spectra with a
