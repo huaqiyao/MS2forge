@@ -81,7 +81,7 @@ rerank/artifacts/
 
 ## Pretrained checkpoints
 
-The three pretrained checkpoints used by MS2Forge are available on
+The three pretrained checkpoints on the MassSpecGym dataset used by MS2Forge are available on
 [Google Drive](https://drive.google.com/drive/folders/1AJlrEUnYLI6ZixD7gbZ91YnN4EDPs_qr?usp=sharing).
 
 | Checkpoint | Description |
