@@ -79,6 +79,18 @@ data/pretrain/pretrain_smiles.csv
 rerank/artifacts/
 ```
 
+## Pretrained checkpoints
+
+The three pretrained checkpoints used by MS2Forge are available on
+[Google Drive](https://drive.google.com/drive/folders/1AJlrEUnYLI6ZixD7gbZ91YnN4EDPs_qr?usp=sharing).
+
+| Checkpoint | Description |
+| --- | --- |
+| `align.pt` | Spectrum–structure alignment model. |
+| `graph2mol.pt` | Graph-conditioned molecular generation model used as the teacher for MS2Mol training. |
+| `ms2mol.pt` | Spectrum-conditioned molecular generation model used for inference. |
+
+
 ## Repository structure
 
 ```text
