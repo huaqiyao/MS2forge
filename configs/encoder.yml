@@ -1,0 +1,66 @@
+# Shared encoder training. Run from the repository root.
+dataset: msg  # Change to nplib1 to fine-tune on the NPLIB1 train split.
+stage: finetune  # pretrain, finetune, or all (pretrain followed by fine-tuning).
+runtime:
+  device: cuda
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]  # Default: eight GPUs.
+  # For a single GPU, use gpu_ids: [0] or pass --gpus 1.
+  # Batch sizes below are GLOBAL, shared across all selected GPUs.
+  threads: 4
+output_root: ${MS2FORGE_ASSETS}/output/encoder
+
+pretrain:
+  # Already cleaned against BOTH MSG and NPLIB1 val/test; use this file directly.
+  parquet: ${MS2FORGE_ASSETS}/shared/data/fraghub_msg_nplib1_joint_clean.parquet
+  parquet_sha256: 3d2d42af2548da619e5c2e473e69042015f64a98e4dfb0491a23de2e5445108e
+  original_parquet: ${MS2FORGE_ASSETS}/shared/data/FragHub_filtered.parquet
+  original_graphs: ${MS2FORGE_ASSETS}/shared/data/FragHub_filtered_smiles_dict.pt
+  prepared_dir: ${MS2FORGE_ASSETS}/shared/prepared/encoder_pretrain
+  seed: 42
+  epochs: 500
+  batch_size: 512
+  ordered_sub_batch_size: 32
+  lr: 0.0004
+  weight_decay: 0.0005
+  betas: [0.9, 0.98]
+  eps: 1.0e-8
+  warmup_steps: 3000
+  temperature: 15.0
+  activation_checkpointing: true
+  save_every_epochs: 50
+  weights: ${MS2FORGE_ASSETS}/shared/checkpoints/encoder/clean_encoder.pth
+
+finetune:
+  # The same pretrained encoder initializes either downstream dataset.
+  # Reuse the downloaded pretrained encoder. --stage all uses the new pretraining output instead.
+  initial_weights: ${MS2FORGE_ASSETS}/shared/checkpoints/encoder/clean_encoder.pth
+  train_split: train  # Use MSG train; setting dataset: nplib1 selects NPLIB1 train.
+  eval_split: val
+  seed: 2026
+  batch_size: 64
+  lr: 0.0005
+  weight_decay: 0.0001
+  betas: [0.99, 0.999]
+  max_grad_norm: 50.0
+  warmup_steps: 500
+  monitor_every: 500
+  monitor_ratio: 0.1
+  scheduler_factor: 0.8
+  scheduler_patience: 1000
+  min_lr: 1.0e-6
+  activation_checkpointing: false
+  # Both the spectrum encoder and graph encoder are trainable.
+
+datasets:
+  msg:
+    data_root: ${MS2FORGE_ASSETS}/msg/data
+    graph_rows: ${MS2FORGE_ASSETS}/msg/data/graph2mol.tsv
+    prepared_dir: ${MS2FORGE_ASSETS}/msg/prepared/encoder
+    steps: 39001
+    weights_dir: ${MS2FORGE_ASSETS}/msg/checkpoints/encoder
+  nplib1:
+    data_root: ${MS2FORGE_ASSETS}/nplib1/data
+    graph_rows: ${MS2FORGE_ASSETS}/nplib1/data/graph2mol.tsv
+    prepared_dir: ${MS2FORGE_ASSETS}/nplib1/prepared/encoder
+    steps: 10000
+    weights_dir: ${MS2FORGE_ASSETS}/nplib1/checkpoints/encoder

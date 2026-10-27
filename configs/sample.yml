@@ -1,0 +1,61 @@
+# Default: MSG. Change to nplib1 to use NPLIB1 data and output paths.
+# An explicit dataset passed to the sampling launcher overrides this value.
+dataset: msg
+architecture_id: eq_cond_unordered_bfn_v1
+model:
+  condition_embedding:
+    embed_dim: 256
+  contrastive_dim: 512
+  ms2forge:
+    beta1: 3.0
+  flow:
+    eval_n_timesteps: 20
+    n_timesteps: 100
+  gat:
+    dropout: 0.15
+    hidden_dim: 512
+    num_layers: 6
+  graph_encoder:
+    n_layers: 4
+  ms_encoder:
+    dim_formula: 144
+    dim_sos: 13
+    dropout: 0.1
+    hidden_dim: 512
+    input_dropout: 0.1
+    max_len: 129
+    nhead: 8
+    num_transformer_layers: 3
+  node_dim: 256
+  noise_scale: 0.0
+  stage: ms2mol
+chem:
+  atomic_numbers:
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 14
+  - 15
+  - 16
+  - 17
+  - 33
+  - 34
+  - 35
+  - 53
+  mol_bond_types:
+  - 1
+  - 2
+  - 3
+  - 4
+# Use the MS2Mol checkpoint trained for the selected dataset.
+checkpoint: ${MS2FORGE_ASSETS}/${DATASET}/output/ms2mol/latest.json
+inputs: ${MS2FORGE_ASSETS}/${DATASET}/generation_inputs.tsv
+zms_root: ${MS2FORGE_ASSETS}/${DATASET}/embeddings/zms
+output: ${MS2FORGE_ASSETS}/${DATASET}/output/rerank_candidates/test
+seed: 2026
+draws: 100
+steps: 20
+batch_size: 8
+encoder_checkpoint: ${MS2FORGE_ASSETS}/${DATASET}/embeddings/encoder.json

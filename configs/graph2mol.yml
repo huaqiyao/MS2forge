@@ -1,0 +1,107 @@
+# Default: MSG. Change to nplib1 to use NPLIB1 data and output paths.
+# An explicit dataset passed to run.py overrides this value.
+dataset: msg
+architecture_id: eq_cond_unordered_bfn_v1
+stage: graph2mol
+model:
+  condition_embedding:
+    embed_dim: 256
+  contrastive_dim: 512
+  ms2forge:
+    beta1: 3.0
+  flow:
+    eval_n_timesteps: 20
+    n_timesteps: 100
+  gat:
+    dropout: 0.15
+    hidden_dim: 512
+    num_layers: 6
+  graph_encoder:
+    n_layers: 4
+  ms_encoder:
+    dim_formula: 144
+    dim_sos: 13
+    dropout: 0.1
+    hidden_dim: 512
+    input_dropout: 0.1
+    max_len: 129
+    nhead: 8
+    num_transformer_layers: 3
+  node_dim: 256
+  noise_scale: 0.0
+  stage: graph2mol
+chem:
+  atomic_numbers:
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 14
+  - 15
+  - 16
+  - 17
+  - 33
+  - 34
+  - 35
+  - 53
+  mol_bond_types:
+  - 1
+  - 2
+  - 3
+  - 4
+eq_cond:
+  condition_dim: 256
+data:
+  train: ${MS2FORGE_ASSETS}/${DATASET}/packed/graph2mol/train
+  val: ${MS2FORGE_ASSETS}/${DATASET}/packed/graph2mol/val
+train:
+  seed: 2026
+  global_batch: 128
+  updates: 20000000
+  max_micro_graphs: 16
+  max_micro_halfedges: 12000
+  validation_every: 2000
+  checkpoint_every: 10000
+  # Dynamic save: model-only exports the complete raw state_dict, like the released .pt.
+  checkpoint_fields:
+    - model
+    # Optional training states: uncomment fields to include them dynamically.
+    # Exact --resume requires ALL fields below; otherwise use --init.
+    # - optimizer
+    # - scheduler
+    # - sampler
+    # - rng
+    # - config
+    # - update
+    # - schema
+    # - architecture_id
+    # - stage
+    # - rank
+    # - world
+    # - encoder_sha256
+  warmup_updates: 500
+  grad_clip: 50.0
+optimizer:
+  lr: 5.0e-05
+  betas:
+  - 0.99
+  - 0.999
+  weight_decay: 0.0001
+  eps: 1.0e-08
+scheduler:
+  factor: 0.8
+  patience: 1000
+  min_lr: 1.0e-06
+kd:
+  feature_layers: all
+  feature_weight: 0.5
+  mse_weight: 0.5
+  student_condition_mode: real
+  teacher_condition_mode: real
+  temperature: 2.0
+  weight: 1.0
+output: ${MS2FORGE_ASSETS}/${DATASET}/output/graph2mol
+# Publish one shared Graph2Mol selection for transfer to either dataset's encoder space.
+publish_checkpoint: ${MS2FORGE_ASSETS}/shared/checkpoints/graph2mol.json
+encoder_checkpoint: ${MS2FORGE_ASSETS}/${DATASET}/embeddings/encoder.json

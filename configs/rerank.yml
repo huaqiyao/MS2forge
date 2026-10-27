@@ -1,0 +1,21 @@
+# Change msg to nplib1 to train and apply the same pipeline on NPLIB1.
+dataset: msg
+data_root: ${MS2FORGE_ASSETS}/${DATASET}/data
+output_dir: ${MS2FORGE_ASSETS}/${DATASET}/output/rerank_training
+candidate_globs:
+  train: ${MS2FORGE_ASSETS}/${DATASET}/output/rerank_candidates/train/candidates_rank*.jsonl
+  val: ${MS2FORGE_ASSETS}/${DATASET}/output/rerank_candidates/val/candidates_rank*.jsonl
+  test: ${MS2FORGE_ASSETS}/${DATASET}/output/rerank_candidates/test/candidates_rank*.jsonl
+sampling_config: ${REPO_ROOT}/configs/sample.yml
+workers: 4
+device: cpu
+seed: 2026
+evidencerank: {}
+stage_a: {}
+ssr:
+  epochs: 12
+  batch_size: 512
+  workers: 0
+  embedding_dim: 256
+  monitor_fraction: 0.05
+ssr_base_weights: '0,0.25,0.5,0.65,0.75,0.8,0.85,0.9,0.925,0.95,0.975,1'
