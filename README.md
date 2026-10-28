@@ -24,8 +24,8 @@ export MS2FORGE_ASSETS="$HOME/ms2forge_assets"
 Set `MS2FORGE_ASSETS` to your external data directory and `DATASET` to `msg` or `nplib1`. `PYTHONPATH` enables direct execution of scripts in subdirectories.
 
 
-All model weights are available on https://drive.google.com/drive/folders/1i60al-sxjCqLjn0YOObrS7amT1Lm7yM3?usp=sharing
-
+All model weights are available on [Google Drive](https://drive.google.com/drive/folders/1i60al-sxjCqLjn0YOObrS7amT1Lm7yM3?usp=sharing).
+A demo is also available in the same folder for reproducibility and evaluation.
 
 ## Training
 
